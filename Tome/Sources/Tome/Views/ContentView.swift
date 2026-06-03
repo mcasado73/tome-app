@@ -18,6 +18,7 @@ private let conferencingBundleIDs: [String: String] = [
 
 struct ContentView: View {
     @Bindable var settings: AppSettings
+    let meetingDetector: MeetingDetector
     @State private var transcriptStore = TranscriptStore()
     @State private var transcriptionEngine: TranscriptionEngine?
     @State private var sessionStore = SessionStore()
@@ -31,7 +32,6 @@ struct ContentView: View {
     @State private var savedFileURL: URL?
     @State private var bannerDismissTask: Task<Void, Never>?
     @State private var sessionElapsed: Int = 0
-    @State private var meetingDetector = MeetingDetector()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -68,9 +68,12 @@ struct ContentView: View {
                 silenceSeconds: silenceSeconds,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError,
-                onStartCallCapture: { startSession(type: .callCapture) },
-                onStartVoiceMemo: { startSession(type: .voiceMemo) },
-                onStop: stopSession
+                // F8: dispatch via main runloop to avoid the SwiftUI 26.4
+                // `_ButtonGesture` → `MainActor.assumeIsolated` path that crashes
+                // in `swift_task_isMainExecutorImpl`.
+                onStartCallCapture: { DispatchQueue.main.async { startSession(type: .callCapture) } },
+                onStartVoiceMemo:   { DispatchQueue.main.async { startSession(type: .voiceMemo) } },
+                onStop:             { DispatchQueue.main.async { stopSession() } }
             )
         }
         .frame(minWidth: 280, maxWidth: 360, minHeight: 400)
@@ -241,8 +244,10 @@ struct ContentView: View {
                 .truncationMode(.middle)
             Spacer()
             Button("Show in Finder") {
-                NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: url.deletingLastPathComponent().path)
-                savedFileURL = nil
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: url.deletingLastPathComponent().path)
+                    savedFileURL = nil
+                }
             }
             .font(.system(size: 11))
             .buttonStyle(.plain)

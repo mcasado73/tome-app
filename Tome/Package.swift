@@ -10,9 +10,15 @@ let package = Package(
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.7.0"),
     ],
     targets: [
+        .target(
+            name: "MicCaptureShim",
+            path: "Sources/MicCaptureShim",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "Tome",
             dependencies: [
+                "MicCaptureShim",
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "Sparkle", package: "Sparkle"),
             ],

@@ -6,7 +6,6 @@ import os
 
 // Writes to /tmp/tome.log
 func diagLog(_ msg: String) {
-    #if DEBUG
     let line = "\(Date()): \(msg)\n"
     let path = "/tmp/tome.log"
     if let fh = FileHandle(forWritingAtPath: path) {
@@ -16,7 +15,6 @@ func diagLog(_ msg: String) {
     } else {
         FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
     }
-    #endif
 }
 
 /// Dual-stream mic + system audio transcription.
@@ -38,6 +36,9 @@ final class TranscriptionEngine {
     private var sysTask: Task<Void, Never>?
     /// Keeps the mic stream alive for the audio level meter when transcription isn't running.
     private var micKeepAliveTask: Task<Void, Never>?
+    /// Fires 15s after a successful start to detect zombie sessions where the
+    /// audio engine hung silently inside CoreAudio.
+    private var watchdogTask: Task<Void, Never>?
 
     /// Shared FluidAudio instances
     private var asrManager: AsrManager?
@@ -59,12 +60,19 @@ final class TranscriptionEngine {
 
     func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil) async {
         diagLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
-        guard !isRunning else { return }
+        guard !isRunning else {
+            diagLog("[ENGINE-0] start() skipped — already running")
+            return
+        }
+        // Claim the slot synchronously, before any await, so a second concurrent
+        // start() call sees isRunning=true and bails out.
+        isRunning = true
         lastError = nil
 
-        guard await ensureMicrophonePermission() else { return }
-
-        isRunning = true
+        guard await ensureMicrophonePermission() else {
+            isRunning = false
+            return
+        }
 
         // 1. Load FluidAudio models
         assetStatus = "Downloading multilingual model (first run)..."
@@ -176,6 +184,23 @@ final class TranscriptionEngine {
 
         // Install CoreAudio listener for default input device changes
         installDefaultDeviceListener()
+
+        // Startup watchdog: if no mic tap callback fires within 15s, the audio
+        // engine startup likely hung inside CoreAudio (we saw this on
+        // macOS 26.4 — `installTap` never returns and the session becomes a
+        // zombie). Abort the session cleanly so the user can restart without
+        // crashing the app on the next button press.
+        watchdogTask?.cancel()
+        watchdogTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(15))
+            guard !Task.isCancelled, let self else { return }
+            guard self.isRunning else { return }
+            if self.micCapture.tapCallCount == 0 {
+                diagLog("[ENGINE-WATCHDOG] no mic tap activity 15s after start — aborting zombie session")
+                await self.stop()
+                self.lastError = "Audio capture stalled — please restart the session"
+            }
+        }
     }
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
@@ -303,6 +328,8 @@ final class TranscriptionEngine {
     func stop() async {
         lastError = nil
         removeDefaultDeviceListener()
+        watchdogTask?.cancel()
+        watchdogTask = nil
         micTask?.cancel()
         sysTask?.cancel()
         micKeepAliveTask?.cancel()

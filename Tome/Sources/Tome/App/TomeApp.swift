@@ -6,11 +6,12 @@ import Sparkle
 struct TomeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var settings = AppSettings()
+    @State private var meetingDetector = MeetingDetector()
     private let updaterController = AppUpdaterController()
 
     var body: some Scene {
         WindowGroup {
-            ContentView(settings: settings)
+            ContentView(settings: settings, meetingDetector: meetingDetector)
                 .onAppear {
                     settings.applyScreenShareVisibility()
                 }

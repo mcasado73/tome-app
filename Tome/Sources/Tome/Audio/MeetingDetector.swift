@@ -2,19 +2,32 @@ import CoreAudio
 import AppKit
 import Observation
 
-/// Monitors the system default input device's "is running" property to detect
-/// when another app (e.g. Teams) starts using the microphone, then checks if
-/// a known conferencing app is running.
+/// Monitors per-process audio input usage via CoreAudio's process objects to
+/// detect when a known conferencing app (Teams, Zoom, etc.) starts/stops using
+/// the microphone.
+///
+/// Unlike a global `IsRunningSomewhere` listener, this approach knows *which*
+/// process is using the mic, so:
+///   1. We can ignore Tome's own capture and detect when the conferencing app
+///      itself releases the mic (fixing auto-stop).
+///   2. We don't get false positives from unrelated apps (Voice Memos, Handy,
+///      etc.) just because a conferencing app happens to be running.
 @Observable
 @MainActor
 final class MeetingDetector {
     private(set) var detectedApp: (bundleID: String, name: String)?
 
-    private var listenerBlock: AudioObjectPropertyListenerBlock?
+    private var processListListener: AudioObjectPropertyListenerBlock?
+    private var perProcessListeners: [AudioObjectID: AudioObjectPropertyListenerBlock] = [:]
     private var stopDebounceTask: Task<Void, Never>?
+    private var pollTask: Task<Void, Never>?
     private var isInstalled = false
 
-    /// How long to wait after the mic is released before signaling stop (seconds).
+    /// Polling interval used as a robust backup to per-process listeners.
+    private let pollInterval: UInt64 = 2
+
+    /// How long to wait after the conferencing app releases the mic before
+    /// signaling stop (seconds). Absorbs brief mutes / device switches.
     private let stopDelay: UInt64 = 20
 
     private let conferencingBundleIDs: [String: String] = [
@@ -31,150 +44,224 @@ final class MeetingDetector {
         "com.microsoft.edgemac": "Edge",
     ]
 
+    private let ownPID: pid_t = ProcessInfo.processInfo.processIdentifier
+
     var onMeetingStarted: ((String, String) -> Void)?  // (bundleID, appName)
     var onMeetingStopped: (() -> Void)?
+
+    // MARK: - Lifecycle
 
     func install() {
         guard !isInstalled else { return }
         isInstalled = true
+        diagLog("[MEETING-DETECT] install — own pid=\(ownPID)")
 
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            Task { @MainActor in
-                self?.handleMicRunningChange()
-            }
-        }
-        listenerBlock = block
+        attachListenersToAllProcesses()
+        diagLog("[MEETING-DETECT] attached per-process listeners to \(perProcessListeners.count) audio processes")
 
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        // Listen for process list changes (audio processes appearing/disappearing).
+        var listAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-
-        // Listen on default input device
-        guard let deviceID = defaultInputDeviceID() else { return }
-        AudioObjectAddPropertyListenerBlock(deviceID, &address, DispatchQueue.main, block)
-
-        // Also listen for default device changes so we can re-attach
-        var defaultDeviceAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let deviceChangeBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        let listBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             Task { @MainActor in
-                self?.reattachListener()
+                self?.attachListenersToAllProcesses()
+                self?.evaluate()
             }
         }
+        processListListener = listBlock
         AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject),
-            &defaultDeviceAddress,
+            &listAddress,
             DispatchQueue.main,
-            deviceChangeBlock
+            listBlock
         )
+
+        // Initial state evaluation (e.g., user enables auto-start mid-meeting).
+        evaluate()
+
+        // Polling loop as a backup mechanism — per-process listeners are
+        // unreliable in practice for some apps' helper audio processes.
+        pollTask = Task { [weak self, pollInterval] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(pollInterval))
+                guard !Task.isCancelled, let self else { return }
+                self.attachListenersToAllProcesses()
+                self.evaluate()
+            }
+        }
     }
 
     func uninstall() {
-        guard isInstalled, let block = listenerBlock else { return }
+        guard isInstalled else { return }
         isInstalled = false
         stopDebounceTask?.cancel()
+        stopDebounceTask = nil
+        pollTask?.cancel()
+        pollTask = nil
 
-        if let deviceID = defaultInputDeviceID() {
-            var address = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        if let block = processListListener {
+            var listAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyProcessObjectList,
                 mScope: kAudioObjectPropertyScopeGlobal,
                 mElement: kAudioObjectPropertyElementMain
             )
-            AudioObjectRemovePropertyListenerBlock(deviceID, &address, DispatchQueue.main, block)
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &listAddress,
+                DispatchQueue.main,
+                block
+            )
+            processListListener = nil
         }
-        listenerBlock = nil
+
+        for (procID, block) in perProcessListeners {
+            var addr = inputRunningAddress()
+            AudioObjectRemovePropertyListenerBlock(procID, &addr, DispatchQueue.main, block)
+        }
+        perProcessListeners.removeAll()
+        detectedApp = nil
     }
 
-    // MARK: - Private
+    // MARK: - Per-process listener management
 
-    private func handleMicRunningChange() {
-        let micInUse = isMicRunning()
-        diagLog("[MEETING-DETECT] mic running = \(micInUse)")
+    private func attachListenersToAllProcesses() {
+        let current = Set(audioProcessObjects())
+        let known = Set(perProcessListeners.keys)
 
-        if micInUse {
+        // Detach from processes that are no longer in the list.
+        for stale in known.subtracting(current) {
+            if let block = perProcessListeners.removeValue(forKey: stale) {
+                var addr = inputRunningAddress()
+                AudioObjectRemovePropertyListenerBlock(stale, &addr, DispatchQueue.main, block)
+            }
+        }
+
+        // Attach to newly appearing processes.
+        for procID in current.subtracting(known) {
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                Task { @MainActor in
+                    self?.evaluate()
+                }
+            }
+            var addr = inputRunningAddress()
+            let status = AudioObjectAddPropertyListenerBlock(procID, &addr, DispatchQueue.main, block)
+            if status == noErr {
+                perProcessListeners[procID] = block
+            }
+        }
+    }
+
+    // MARK: - Core evaluation
+
+    /// Returns the first conferencing app currently using audio input (excluding
+    /// ourselves), if any.
+    private func currentConferencingInputUser() -> (bundleID: String, name: String)? {
+        var match: (bundleID: String, name: String)?
+        var activeSummary: [String] = []
+        for procID in audioProcessObjects() {
+            guard processIsRunningInput(procID) else { continue }
+            let pid = processPID(procID) ?? -1
+            let app = pid > 0 ? NSRunningApplication(processIdentifier: pid) : nil
+            let bid = app?.bundleIdentifier ?? "<no-bundle>"
+            let name = app?.localizedName ?? "<no-name>"
+            activeSummary.append("pid=\(pid) bid=\(bid) name=\(name)")
+            if pid == ownPID { continue }
+            if match == nil, let confName = conferencingBundleIDs[bid] {
+                match = (bid, confName)
+            }
+        }
+        if !activeSummary.isEmpty {
+            diagLog("[MEETING-DETECT] processes with input active: \(activeSummary.joined(separator: " | ")) → match=\(match?.name ?? "none")")
+        }
+        return match
+    }
+
+    private func evaluate() {
+        let current = currentConferencingInputUser()
+
+        if let current {
+            // A conferencing app is using the mic — cancel any pending stop.
             stopDebounceTask?.cancel()
             stopDebounceTask = nil
 
-            // Already tracking a meeting
-            guard detectedApp == nil else { return }
-
-            // Check if a conferencing app is running
-            if let app = findRunningConferencingApp() {
-                diagLog("[MEETING-DETECT] detected conferencing app: \(app.name) (\(app.bundleID))")
-                detectedApp = app
-                onMeetingStarted?(app.bundleID, app.name)
+            if detectedApp == nil {
+                diagLog("[MEETING-DETECT] \(current.name) (\(current.bundleID)) opened mic — starting")
+                detectedApp = current
+                onMeetingStarted?(current.bundleID, current.name)
             }
         } else {
-            // Mic released — debounce before signaling stop
-            guard detectedApp != nil else { return }
-            stopDebounceTask?.cancel()
-            stopDebounceTask = Task {
-                try? await Task.sleep(for: .seconds(stopDelay))
-                guard !Task.isCancelled else { return }
-                // Re-check: mic might have resumed (e.g. brief mute)
-                if !self.isMicRunning() {
-                    diagLog("[MEETING-DETECT] mic still off after delay, stopping session")
+            // No conferencing app currently has input running.
+            guard let tracking = detectedApp, stopDebounceTask == nil else { return }
+            diagLog("[MEETING-DETECT] \(tracking.name) released mic — debouncing \(stopDelay)s")
+            let delay = stopDelay
+            stopDebounceTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled, let self else { return }
+                if self.currentConferencingInputUser() == nil {
+                    diagLog("[MEETING-DETECT] still released after \(delay)s — signaling stop")
                     self.detectedApp = nil
+                    self.stopDebounceTask = nil
                     self.onMeetingStopped?()
                 }
             }
         }
     }
 
-    private func findRunningConferencingApp() -> (bundleID: String, name: String)? {
-        for app in NSWorkspace.shared.runningApplications {
-            guard let bundleID = app.bundleIdentifier,
-                  let name = conferencingBundleIDs[bundleID] else { continue }
-            return (bundleID, name)
-        }
-        return nil
-    }
+    // MARK: - CoreAudio helpers
 
-    private func isMicRunning() -> Bool {
-        guard let deviceID = defaultInputDeviceID() else { return false }
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+    private func inputRunningAddress() -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyIsRunningInput,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var isRunning: UInt32 = 0
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &isRunning)
-        return status == noErr && isRunning != 0
     }
 
-    private func defaultInputDeviceID() -> AudioDeviceID? {
+    private func audioProcessObjects() -> [AudioObjectID] {
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mSelector: kAudioHardwarePropertyProcessObjectList,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var deviceID: AudioDeviceID = 0
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        let status = AudioObjectGetPropertyData(
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
             AudioObjectID(kAudioObjectSystemObject),
-            &address, 0, nil, &size, &deviceID
-        )
-        return status == noErr ? deviceID : nil
+            &address, 0, nil, &dataSize) == noErr else { return [] }
+        let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        guard count > 0 else { return [] }
+        var ids = [AudioObjectID](repeating: 0, count: count)
+        let status = ids.withUnsafeMutableBufferPointer { buf -> OSStatus in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address, 0, nil, &dataSize, buf.baseAddress!)
+        }
+        return status == noErr ? ids : []
     }
 
-    private func reattachListener() {
-        guard isInstalled, let block = listenerBlock else { return }
-        // Remove from old device (best-effort, may fail if device gone)
+    private func processPID(_ procID: AudioObjectID) -> pid_t? {
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mSelector: kAudioProcessPropertyPID,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        // Re-attach to new default device
-        if let deviceID = defaultInputDeviceID() {
-            AudioObjectAddPropertyListenerBlock(deviceID, &address, DispatchQueue.main, block)
-            diagLog("[MEETING-DETECT] reattached listener to device \(deviceID)")
-        }
+        var pid: pid_t = -1
+        var size = UInt32(MemoryLayout<pid_t>.size)
+        let status = AudioObjectGetPropertyData(procID, &address, 0, nil, &size, &pid)
+        return status == noErr && pid > 0 ? pid : nil
+    }
+
+    private func processIsRunningInput(_ procID: AudioObjectID) -> Bool {
+        var address = inputRunningAddress()
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(procID, &address, 0, nil, &size, &value)
+        return status == noErr && value != 0
+    }
+
+    private func bundleID(forPID pid: pid_t) -> String? {
+        NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
     }
 }

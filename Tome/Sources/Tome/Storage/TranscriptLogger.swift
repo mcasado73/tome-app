@@ -2,8 +2,12 @@ import Foundation
 
 enum TranscriptLoggerError: LocalizedError {
     case cannotCreateFile(String)
+    case sessionAlreadyActive
     var errorDescription: String? {
-        switch self { case .cannotCreateFile(let p): return "Cannot create transcript at \(p)" }
+        switch self {
+        case .cannotCreateFile(let p): return "Cannot create transcript at \(p)"
+        case .sessionAlreadyActive: return "A transcript session is already active"
+        }
     }
 }
 
@@ -28,6 +32,10 @@ actor TranscriptLogger {
     private var lastSessionContext: String = ""
 
     func startSession(sourceApp: String, vaultPath: String, sessionType: SessionType = .callCapture) throws {
+        if fileHandle != nil {
+            diagLog("[LOGGER] startSession called while previous session active — refusing")
+            throw TranscriptLoggerError.sessionAlreadyActive
+        }
         self.sourceApp = sourceApp
         self.sessionStartTime = Date()
         self.speakersDetected = []

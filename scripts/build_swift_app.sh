@@ -77,64 +77,83 @@ echo -n "APPL????" > "$APP_DIR/Contents/PkgInfo"
 echo "App bundle created: $APP_DIR"
 
 # Auto-detect signing identity if not set
+ADHOC_SIGN=0
 if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
   CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
   if [[ -z "$CODESIGN_IDENTITY" ]]; then
     CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Apple Development" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
   fi
+  if [[ -z "$CODESIGN_IDENTITY" ]]; then
+    echo "No Developer ID / Apple Development identity found — falling back to ad-hoc signing (local testing only)."
+    CODESIGN_IDENTITY="-"
+    ADHOC_SIGN=1
+  fi
+elif [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+  ADHOC_SIGN=1
 fi
 
-# Sign the app
-if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
-  ENTITLEMENTS="$SWIFT_DIR/Sources/Tome/Tome.entitlements"
-  echo "Signing with: $CODESIGN_IDENTITY"
+# Timestamp/runtime flags: ad-hoc cannot use --timestamp (no trust chain) and
+# must disable library validation (Sparkle has a different / no Team ID).
+ENTITLEMENTS="$SWIFT_DIR/Sources/Tome/Tome.entitlements"
+TIMESTAMP_FLAG=(--timestamp)
+if [[ "$ADHOC_SIGN" == "1" ]]; then
+  TIMESTAMP_FLAG=()
+  ADHOC_ENTITLEMENTS="$(mktemp -t tome-adhoc-entitlements).plist"
+  /usr/libexec/PlistBuddy -c "Merge $ENTITLEMENTS" "$ADHOC_ENTITLEMENTS" >/dev/null 2>&1 || cp "$ENTITLEMENTS" "$ADHOC_ENTITLEMENTS"
+  /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.disable-library-validation bool true" "$ADHOC_ENTITLEMENTS" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Set :com.apple.security.cs.disable-library-validation true" "$ADHOC_ENTITLEMENTS"
+  ENTITLEMENTS="$ADHOC_ENTITLEMENTS"
+  trap 'rm -f "$ADHOC_ENTITLEMENTS"' EXIT
+fi
 
-  # Sign Sparkle components inside-out (innermost first)
-  SPARKLE_FW_BUNDLE="$APP_DIR/Contents/Frameworks/Sparkle.framework"
-  if [[ -d "$SPARKLE_FW_BUNDLE" ]]; then
-    # Sign XPC service executables, then their bundles
-    for xpc in "$SPARKLE_FW_BUNDLE"/Versions/B/XPCServices/*.xpc; do
-      if [[ -d "$xpc" ]]; then
-        codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$xpc/Contents/MacOS/$(basename "${xpc%.xpc}")"
-        codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$xpc"
-      fi
-    done
+echo "Signing with: $CODESIGN_IDENTITY"
 
-    # Sign Autoupdate helper
-    AUTOUPDATE="$SPARKLE_FW_BUNDLE/Versions/B/Autoupdate"
-    if [[ -f "$AUTOUPDATE" ]]; then
-      codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$AUTOUPDATE"
+# Sign Sparkle components inside-out (innermost first)
+SPARKLE_FW_BUNDLE="$APP_DIR/Contents/Frameworks/Sparkle.framework"
+if [[ -d "$SPARKLE_FW_BUNDLE" ]]; then
+  # Sign XPC service executables, then their bundles
+  for xpc in "$SPARKLE_FW_BUNDLE"/Versions/B/XPCServices/*.xpc; do
+    if [[ -d "$xpc" ]]; then
+      codesign --force --options runtime --sign "$CODESIGN_IDENTITY" ${TIMESTAMP_FLAG[@]+"${TIMESTAMP_FLAG[@]}"} "$xpc/Contents/MacOS/$(basename "${xpc%.xpc}")"
+      codesign --force --options runtime --sign "$CODESIGN_IDENTITY" ${TIMESTAMP_FLAG[@]+"${TIMESTAMP_FLAG[@]}"} "$xpc"
     fi
+  done
 
-    # Sign Updater.app
-    UPDATER_APP="$SPARKLE_FW_BUNDLE/Versions/B/Updater.app"
-    if [[ -d "$UPDATER_APP" ]]; then
-      codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$UPDATER_APP/Contents/MacOS/Updater"
-      codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$UPDATER_APP"
-    fi
-
-    # Sign the framework dylib, then the framework bundle
-    codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$SPARKLE_FW_BUNDLE/Versions/B/Sparkle"
-    codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$SPARKLE_FW_BUNDLE"
+  # Sign Autoupdate helper
+  AUTOUPDATE="$SPARKLE_FW_BUNDLE/Versions/B/Autoupdate"
+  if [[ -f "$AUTOUPDATE" ]]; then
+    codesign --force --options runtime --sign "$CODESIGN_IDENTITY" ${TIMESTAMP_FLAG[@]+"${TIMESTAMP_FLAG[@]}"} "$AUTOUPDATE"
   fi
 
-  # Sign the main app bundle
-  codesign --force --options runtime \
-    --sign "$CODESIGN_IDENTITY" \
-    --entitlements "$ENTITLEMENTS" \
-    --timestamp \
-    "$APP_DIR"
+  # Sign Updater.app
+  UPDATER_APP="$SPARKLE_FW_BUNDLE/Versions/B/Updater.app"
+  if [[ -d "$UPDATER_APP" ]]; then
+    codesign --force --options runtime --sign "$CODESIGN_IDENTITY" ${TIMESTAMP_FLAG[@]+"${TIMESTAMP_FLAG[@]}"} "$UPDATER_APP/Contents/MacOS/Updater"
+    codesign --force --options runtime --sign "$CODESIGN_IDENTITY" ${TIMESTAMP_FLAG[@]+"${TIMESTAMP_FLAG[@]}"} "$UPDATER_APP"
+  fi
 
-  echo "Code signing complete"
-  codesign -vvv "$APP_DIR"
-else
-  echo "Error: No signing identity found. App will be unsigned."
-  echo "Set CODESIGN_IDENTITY or install a Developer ID certificate."
-  exit 1
+  # Sign the framework dylib, then the framework bundle
+  codesign --force --options runtime --sign "$CODESIGN_IDENTITY" ${TIMESTAMP_FLAG[@]+"${TIMESTAMP_FLAG[@]}"} "$SPARKLE_FW_BUNDLE/Versions/B/Sparkle"
+  codesign --force --options runtime --sign "$CODESIGN_IDENTITY" ${TIMESTAMP_FLAG[@]+"${TIMESTAMP_FLAG[@]}"} "$SPARKLE_FW_BUNDLE"
 fi
 
-# Install to /Applications
-cp -R "$APP_DIR" /Applications/
-echo "Installed to /Applications/$APP_NAME.app"
+# Sign the main app bundle
+codesign --force --options runtime \
+  --sign "$CODESIGN_IDENTITY" \
+  --entitlements "$ENTITLEMENTS" \
+  ${TIMESTAMP_FLAG[@]+"${TIMESTAMP_FLAG[@]}"} \
+  "$APP_DIR"
+
+echo "Code signing complete"
+codesign -vvv "$APP_DIR"
+
+# Leave the built bundle in dist/ — caller copies it where they need.
+# Ad-hoc-signed apps inherit no Developer ID trust, so strip the quarantine
+# attribute to avoid Gatekeeper blocking launch on local installs.
+if [[ "$ADHOC_SIGN" == "1" ]]; then
+  xattr -dr com.apple.quarantine "$APP_DIR" 2>/dev/null || true
+  echo "Note: app is ad-hoc signed — for local testing only, not distributable."
+fi
+echo "Built bundle: $APP_DIR"
 
 echo "=== Build complete ==="
