@@ -160,6 +160,17 @@ struct ContentView: View {
                 transcriptionEngine?.restartMic(inputDeviceID: settings.inputDeviceID)
             }
         }
+        // The engine can stop itself (watchdog aborting a zombie session, or a
+        // fatal capture error) without ContentView knowing. When that happens
+        // while a session is still logically active, finalize it so the
+        // TranscriptLogger file handle is closed — otherwise the next auto-start
+        // is refused forever and the app looks hung with a stuck recording.
+        .onChange(of: transcriptionEngine?.isRunning) { _, running in
+            if running == false, activeSessionType != nil {
+                diagLog("[AUTO-STOP] engine stopped unexpectedly — finalizing session")
+                stopSession()
+            }
+        }
         .onChange(of: transcriptStore.utterances.count) {
             handleNewUtterance()
         }
@@ -312,9 +323,18 @@ struct ContentView: View {
             await transcriptionEngine?.start(
                 locale: settings.locale,
                 inputDeviceID: settings.inputDeviceID,
-                appBundleID: appBundleID
+                appBundleID: appBundleID,
+                vocabularyCorrector: makeVocabularyCorrector()
             )
         }
+    }
+
+    /// Builds a vocabulary corrector from the current settings, or nil if disabled/empty.
+    private func makeVocabularyCorrector() -> VocabularyCorrector? {
+        guard settings.vocabularyEnabled, let url = settings.vocabularyURL else { return nil }
+        let set = VocabularyLoader.load(from: url)
+        guard !set.isEmpty else { return nil }
+        return VocabularyCorrector(terms: set.terms, corrections: set.corrections)
     }
 
     // MARK: - Actions
@@ -365,16 +385,19 @@ struct ContentView: View {
             }
             activeSessionType = type
             detectedAppName = resolvedAppName
+            let corrector = makeVocabularyCorrector()
             if type == .callCapture {
                 await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
-                    appBundleID: appBundleID
+                    appBundleID: appBundleID,
+                    vocabularyCorrector: corrector
                 )
             } else {
                 await transcriptionEngine?.start(
                     locale: settings.locale,
-                    inputDeviceID: settings.inputDeviceID
+                    inputDeviceID: settings.inputDeviceID,
+                    vocabularyCorrector: corrector
                 )
             }
         }

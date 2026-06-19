@@ -33,6 +33,16 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(autoStartEnabled, forKey: "autoStartEnabled") }
     }
 
+    /// When true, applies custom-vocabulary corrections to transcribed text.
+    var vocabularyEnabled: Bool {
+        didSet { UserDefaults.standard.set(vocabularyEnabled, forKey: "vocabularyEnabled") }
+    }
+
+    /// Folder containing `.txt` vocabulary files. Empty means none selected.
+    var vocabularyPath: String {
+        didSet { UserDefaults.standard.set(vocabularyPath, forKey: "vocabularyPath") }
+    }
+
     /// When true, all app windows are invisible to screen sharing / recording.
     var hideFromScreenShare: Bool {
         didSet {
@@ -48,6 +58,8 @@ final class AppSettings {
         self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? NSString("~/Documents/Tome/Meetings").expandingTildeInPath
         self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Tome/Voice").expandingTildeInPath
         self.autoStartEnabled = defaults.bool(forKey: "autoStartEnabled")
+        self.vocabularyEnabled = defaults.bool(forKey: "vocabularyEnabled")
+        self.vocabularyPath = defaults.string(forKey: "vocabularyPath") ?? ""
         // Default to true (hidden) if key has never been set
         if defaults.object(forKey: "hideFromScreenShare") == nil {
             self.hideFromScreenShare = true
@@ -72,6 +84,11 @@ final class AppSettings {
     var vaultVoiceURL: URL? {
         guard !vaultVoicePath.isEmpty else { return nil }
         return URL(fileURLWithPath: vaultVoicePath)
+    }
+
+    var vocabularyURL: URL? {
+        guard !vocabularyPath.isEmpty else { return nil }
+        return URL(fileURLWithPath: vocabularyPath)
     }
 
     var locale: Locale {

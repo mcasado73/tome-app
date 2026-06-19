@@ -69,6 +69,34 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Vocabulary") {
+                Toggle("Custom vocabulary", isOn: $settings.vocabularyEnabled)
+                    .font(.system(size: 12))
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Folder")
+                            .font(.system(size: 12, weight: .medium))
+                        Text(settings.vocabularyPath.isEmpty ? "No folder selected" : settings.vocabularyPath)
+                            .font(.system(size: 11))
+                            .foregroundStyle(settings.vocabularyPath.isEmpty ? .tertiary : .secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer()
+
+                    Button("Choose...") {
+                        chooseFolder(message: "Choose a folder of .txt vocabulary files") { path in
+                            settings.vocabularyPath = path
+                        }
+                    }
+                }
+                .disabled(!settings.vocabularyEnabled)
+                Text("Fixes domain terms and names in transcripts. Add .txt files with one term per line, or corrections like \"Post Grass = PostgreSQL\".")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Privacy") {
                 Toggle("Hide from screen sharing", isOn: $settings.hideFromScreenShare)
                     .font(.system(size: 12))
@@ -86,7 +114,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 450, height: 500)
+        .frame(width: 450, height: 640)
         .onAppear {
             inputDevices = MicCapture.availableInputDevices()
         }

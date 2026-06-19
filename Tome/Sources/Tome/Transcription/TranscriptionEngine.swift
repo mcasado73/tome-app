@@ -45,6 +45,9 @@ final class TranscriptionEngine {
     private var micVadManager: VadManager?
     private var sysVadManager: VadManager?
 
+    /// Optional custom-vocabulary corrector applied to finalized utterances.
+    private var vocabularyCorrector: VocabularyCorrector?
+
     /// Tracks the resolved mic device ID currently in use.
     private var currentMicDeviceID: AudioDeviceID = 0
 
@@ -58,7 +61,7 @@ final class TranscriptionEngine {
         self.transcriptStore = transcriptStore
     }
 
-    func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil) async {
+    func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil, vocabularyCorrector: VocabularyCorrector? = nil) async {
         diagLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
         guard !isRunning else {
             diagLog("[ENGINE-0] start() skipped — already running")
@@ -68,6 +71,10 @@ final class TranscriptionEngine {
         // start() call sees isRunning=true and bails out.
         isRunning = true
         lastError = nil
+        self.vocabularyCorrector = vocabularyCorrector
+        if let vocabularyCorrector {
+            diagLog("[ENGINE-VOCAB] enabled: \(vocabularyCorrector.termCount) terms, \(vocabularyCorrector.correctionCount) corrections")
+        }
 
         guard await ensureMicrophonePermission() else {
             isRunning = false
@@ -126,6 +133,7 @@ final class TranscriptionEngine {
 
         // 4. Start mic transcription
         let store = transcriptStore
+        let corrector = vocabularyCorrector
         let micTranscriber = StreamingTranscriber(
             asrManager: asrManager,
             vadManager: micVadManager,
@@ -135,9 +143,10 @@ final class TranscriptionEngine {
                 Task { @MainActor in store.volatileYouText = text }
             },
             onFinal: { text in
+                let corrected = corrector?.apply(text) ?? text
                 Task { @MainActor in
                     store.volatileYouText = ""
-                    store.append(Utterance(text: text, speaker: .you))
+                    store.append(Utterance(text: corrected, speaker: .you))
                 }
             }
         )
@@ -162,9 +171,10 @@ final class TranscriptionEngine {
                     Task { @MainActor in store.volatileThemText = text }
                 },
                 onFinal: { text in
+                    let corrected = corrector?.apply(text) ?? text
                     Task { @MainActor in
                         store.volatileThemText = ""
-                        store.append(Utterance(text: text, speaker: .them))
+                        store.append(Utterance(text: corrected, speaker: .them))
                     }
                 }
             )
@@ -230,6 +240,7 @@ final class TranscriptionEngine {
         // Start new mic stream
         let micStream = micCapture.bufferStream(deviceID: targetMicID)
         let store = transcriptStore
+        let corrector = vocabularyCorrector
         let micTranscriber = StreamingTranscriber(
             asrManager: asrManager,
             vadManager: micVadManager,
@@ -239,9 +250,10 @@ final class TranscriptionEngine {
                 Task { @MainActor in store.volatileYouText = text }
             },
             onFinal: { text in
+                let corrected = corrector?.apply(text) ?? text
                 Task { @MainActor in
                     store.volatileYouText = ""
-                    store.append(Utterance(text: text, speaker: .you))
+                    store.append(Utterance(text: corrected, speaker: .you))
                 }
             }
         )
