@@ -4,16 +4,27 @@ import FluidAudio
 import Observation
 import os
 
-// Writes to /tmp/tome.log
+// Writes to /tmp/tome.log, rotating to /tmp/tome.log.1 once the file grows past
+// ~5 MB (keeps one backup, so total on-disk footprint stays ~10 MB).
 func diagLog(_ msg: String) {
     let line = "\(Date()): \(msg)\n"
     let path = "/tmp/tome.log"
+    let maxBytes: UInt64 = 5 * 1024 * 1024
+    guard let data = line.data(using: .utf8) else { return }
     if let fh = FileHandle(forWritingAtPath: path) {
-        fh.seekToEndOfFile()
-        fh.write(line.data(using: .utf8)!)
+        let size = fh.seekToEndOfFile()
+        if size > maxBytes {
+            fh.closeFile()
+            let backup = path + ".1"
+            try? FileManager.default.removeItem(atPath: backup)
+            try? FileManager.default.moveItem(atPath: path, toPath: backup)
+            FileManager.default.createFile(atPath: path, contents: data)
+            return
+        }
+        fh.write(data)
         fh.closeFile()
     } else {
-        FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
+        FileManager.default.createFile(atPath: path, contents: data)
     }
 }
 

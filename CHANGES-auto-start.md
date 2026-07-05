@@ -207,3 +207,57 @@ reentrada.
 ### Archivos modificados en esta iteración
 
 - `Tome/Sources/Tome/Views/ContentView.swift` — observador de auto-finalización.
+
+## Iteración 4 — reuniones no detectadas por proceso no reconocido (sesión 2026-07-05)
+
+### Problema detectado en uso real
+
+Con el auto-start activado (`autoStartEnabled = true` confirmado), varias reuniones
+seguidas **no arrancaron la transcripción**. El análisis de `/tmp/tome.log` mostró
+que el detector sí estaba corriendo y sondeando, pero el proceso que abría el
+micrófono nunca casaba con la lista de apps conocidas:
+
+```
+2026-07-03 ... [MEETING-DETECT] processes with input active: pid=955 bid=com.microsoft.teams2.modulehost name=Microsoft Teams ModuleHost → match=none
+2026-07-05 ... [MEETING-DETECT] processes with input active: pid=781 bid=<no-bundle> name=<no-name> → match=none
+```
+
+(Zoom sí funcionaba: el 2026-07-01 casó `us.zoom.xos` y disparó `[AUTO-START]`.)
+
+### Causa raíz
+
+`MeetingDetector.currentConferencingInputUser()` casaba por **bundle ID exacto**
+(`conferencingBundleIDs[bid]`), pero:
+
+1. El **Teams nuevo captura el audio en un proceso auxiliar**
+   `com.microsoft.teams2.modulehost`, no en `com.microsoft.teams2`. El match exacto
+   fallaba en todas las reuniones de Teams (aparece 12.590 veces con `match=none`).
+2. Algunas reuniones las servía un proceso **sin bundle ID resoluble**
+   (`<no-bundle>` vía `NSRunningApplication`), imposible de casar por bundle.
+3. **Firefox** (`org.mozilla.firefox`) tampoco estaba en la lista.
+
+### Solución
+
+`Tome/Sources/Tome/Audio/MeetingDetector.swift`:
+
+- **Match por prefijo** de bundle ID (`bid == prefix || bid.hasPrefix(prefix + ".")`),
+  con límite en el punto para evitar falsos positivos. Cubre `...modulehost` de
+  Teams y los helpers `.helper` de Chrome/Edge.
+- **Fallback por ruta del ejecutable** (`proc_pidpath`) cuando el proceso no tiene
+  bundle ID, buscando palabras clave (`microsoft teams`, `zoom`, `firefox`,
+  `webex`, `cisco`, `slack`, `google chrome`, `microsoft edge`).
+- Añadido **Firefox** a `conferencingBundleIDs`.
+
+Nuevo helper `conferencingName(bundleID:pid:)` que centraliza ambas estrategias, y
+`executablePath(forPID:)`.
+
+### Rotación del log de diagnóstico
+
+`Tome/Sources/Tome/Transcription/TranscriptionEngine.swift` — `diagLog()` rota a
+`/tmp/tome.log.1` al superar ~5 MB (conserva un backup; el `/tmp/tome.log` había
+llegado a 5,8 MB acumulados). Footprint máximo en disco ~10 MB.
+
+### Archivos modificados en esta iteración
+
+- `Tome/Sources/Tome/Audio/MeetingDetector.swift` — match por prefijo + fallback por ruta + Firefox.
+- `Tome/Sources/Tome/Transcription/TranscriptionEngine.swift` — rotación de `/tmp/tome.log`.

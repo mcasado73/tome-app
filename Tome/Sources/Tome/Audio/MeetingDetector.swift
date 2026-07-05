@@ -1,6 +1,7 @@
 import CoreAudio
 import AppKit
 import Observation
+import Darwin  // proc_pidpath
 
 /// Monitors per-process audio input usage via CoreAudio's process objects to
 /// detect when a known conferencing app (Teams, Zoom, etc.) starts/stops using
@@ -30,6 +31,10 @@ final class MeetingDetector {
     /// signaling stop (seconds). Absorbs brief mutes / device switches.
     private let stopDelay: UInt64 = 20
 
+    /// Known conferencing bundle IDs, matched by *prefix* (see `conferencingName`)
+    /// so helper processes that actually own the mic also count — e.g. the new
+    /// Teams captures audio in `com.microsoft.teams2.modulehost`, and Chrome/Edge
+    /// use `<bundle>.helper` processes.
     private let conferencingBundleIDs: [String: String] = [
         "com.microsoft.teams2": "Teams",
         "com.microsoft.teams": "Teams",
@@ -42,6 +47,21 @@ final class MeetingDetector {
         "company.thebrowser.Browser": "Arc",
         "com.apple.Safari": "Safari",
         "com.microsoft.edgemac": "Edge",
+        "org.mozilla.firefox": "Firefox",
+    ]
+
+    /// Fallback keywords matched against a process's executable path when the
+    /// mic-owning process has no resolvable bundle identifier (observed for some
+    /// helper/XPC audio processes that report `<no-bundle>` via NSRunningApplication).
+    private let conferencingPathHints: [(needle: String, name: String)] = [
+        ("microsoft teams", "Teams"),
+        ("zoom", "Zoom"),
+        ("firefox", "Firefox"),
+        ("webex", "Webex"),
+        ("cisco", "Webex"),
+        ("slack", "Slack"),
+        ("google chrome", "Chrome"),
+        ("microsoft edge", "Edge"),
     ]
 
     private let ownPID: pid_t = ProcessInfo.processInfo.processIdentifier
@@ -169,7 +189,7 @@ final class MeetingDetector {
             let name = app?.localizedName ?? "<no-name>"
             activeSummary.append("pid=\(pid) bid=\(bid) name=\(name)")
             if pid == ownPID { continue }
-            if match == nil, let confName = conferencingBundleIDs[bid] {
+            if match == nil, let confName = conferencingName(bundleID: app?.bundleIdentifier, pid: pid) {
                 match = (bid, confName)
             }
         }
@@ -177,6 +197,25 @@ final class MeetingDetector {
             diagLog("[MEETING-DETECT] processes with input active: \(activeSummary.joined(separator: " | ")) → match=\(match?.name ?? "none")")
         }
         return match
+    }
+
+    /// Resolves a conferencing app name for a mic-owning process, first by a
+    /// prefix match on its bundle ID (so helper processes like Teams'
+    /// `...modulehost` count), then by an executable-path keyword fallback for
+    /// processes with no resolvable bundle identifier.
+    private func conferencingName(bundleID: String?, pid: pid_t) -> String? {
+        if let bundleID {
+            for (prefix, name) in conferencingBundleIDs
+            where bundleID == prefix || bundleID.hasPrefix(prefix + ".") {
+                return name
+            }
+        }
+        if let path = executablePath(forPID: pid)?.lowercased() {
+            for hint in conferencingPathHints where path.contains(hint.needle) {
+                return hint.name
+            }
+        }
+        return nil
     }
 
     private func evaluate() {
@@ -263,5 +302,13 @@ final class MeetingDetector {
 
     private func bundleID(forPID pid: pid_t) -> String? {
         NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+    }
+
+    private func executablePath(forPID pid: pid_t) -> String? {
+        guard pid > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let len = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard len > 0 else { return nil }
+        return String(decoding: buffer.prefix(Int(len)).map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 }
