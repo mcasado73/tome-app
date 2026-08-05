@@ -28,6 +28,20 @@ func diagLog(_ msg: String) {
     }
 }
 
+/// One diarized speech region. Times are seconds relative to the start of the
+/// buffered WAV, not to the start of the session.
+struct DiarizedSegment: Sendable {
+    let speakerId: String
+    let startTime: Float
+    let endTime: Float
+}
+
+/// Diarization output plus the wall-clock instant its times are relative to.
+struct PostSessionDiarization: Sendable {
+    let segments: [DiarizedSegment]
+    let audioStartWallClock: Date
+}
+
 /// Dual-stream mic + system audio transcription.
 @Observable
 @MainActor
@@ -367,15 +381,17 @@ final class TranscriptionEngine {
     }
 
     /// Run offline diarization on the buffered system audio.
-    /// Returns speaker segments (speakerId, startTime, endTime) or nil if no audio was buffered.
-    nonisolated func runPostSessionDiarization() async -> [(speakerId: String, startTime: Float, endTime: Float)]? {
-        guard let bufferURL = systemCapture.bufferFilePath,
-              FileManager.default.fileExists(atPath: bufferURL.path) else {
+    /// Returns the speaker segments and their wall-clock anchor, or nil if no
+    /// audio was buffered or diarization failed.
+    nonisolated func runPostSessionDiarization() async -> PostSessionDiarization? {
+        // Detach before the first await: an auto-started session could otherwise
+        // replace the buffer path — or delete the file — while we diarize.
+        guard let audio = systemCapture.detachBuffer() else {
             diagLog("[DIARIZE] No buffered system audio file found")
             return nil
         }
 
-        diagLog("[DIARIZE] Starting post-session diarization on \(bufferURL.lastPathComponent)")
+        diagLog("[DIARIZE] Starting post-session diarization on \(audio.url.lastPathComponent)")
 
         do {
             let diarizer = OfflineDiarizerManager()
@@ -384,18 +400,22 @@ final class TranscriptionEngine {
             try await diarizer.prepareModels()
 
             diagLog("[DIARIZE] Processing audio...")
-            let result = try await diarizer.process(bufferURL)
+            let result = try await diarizer.process(audio.url)
 
             let segments = result.segments.map { seg in
-                (speakerId: seg.speakerId, startTime: seg.startTimeSeconds, endTime: seg.endTimeSeconds)
+                DiarizedSegment(
+                    speakerId: seg.speakerId,
+                    startTime: seg.startTimeSeconds,
+                    endTime: seg.endTimeSeconds
+                )
             }
             diagLog("[DIARIZE] Found \(segments.count) segments, \(Set(segments.map(\.speakerId)).count) speakers")
 
-            systemCapture.cleanupBufferFile()
-            return segments
+            systemCapture.removeBuffer(audio)
+            return PostSessionDiarization(segments: segments, audioStartWallClock: audio.startWallClock)
         } catch {
             diagLog("[DIARIZE] Failed: \(error.localizedDescription)")
-            systemCapture.cleanupBufferFile()
+            systemCapture.removeBuffer(audio)
             return nil
         }
     }

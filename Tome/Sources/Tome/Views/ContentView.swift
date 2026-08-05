@@ -32,6 +32,8 @@ struct ContentView: View {
     @State private var savedFileURL: URL?
     @State private var bannerDismissTask: Task<Void, Never>?
     @State private var sessionElapsed: Int = 0
+    /// Guards against re-entrant stopSession() while teardown is in flight.
+    @State private var isStopping = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -404,6 +406,16 @@ struct ContentView: View {
     }
 
     private func stopSession() {
+        // Three independent triggers can fire this (silence timeout, the meeting
+        // detector, the engine stopping itself) and the teardown takes seconds.
+        // A second entry used to clear the state that diarization still needed,
+        // silently discarding the rewrite and the save banner.
+        guard !isStopping else {
+            diagLog("[STOP] stopSession already in progress — ignoring")
+            return
+        }
+        isStopping = true
+
         let wasCallCapture = activeSessionType == .callCapture
         activeSessionType = nil
         detectedAppName = nil
@@ -412,18 +424,33 @@ struct ContentView: View {
         Task {
             await transcriptionEngine?.stop()
             await sessionStore.endSession()
-            await transcriptLogger.endSession()
+            let endedSessionID = await transcriptLogger.endSession()
 
+            // Teardown is done; release the guard here rather than after the
+            // post-session work, which can run for minutes on a long recording
+            // and would otherwise block the *next* session from ever closing.
+            // From here on the session ID is what keeps late work off the wrong
+            // file.
+            isStopping = false
+            guard let sessionID = endedSessionID else { return }
+
+            var diarized = false
             if wasCallCapture {
                 transcriptionEngine?.assetStatus = "Identifying speakers..."
-                if let segments = await transcriptionEngine?.runPostSessionDiarization() {
+                if let diarization = await transcriptionEngine?.runPostSessionDiarization(),
+                   !diarization.segments.isEmpty {
                     transcriptionEngine?.assetStatus = "Rewriting transcript..."
-                    await transcriptLogger.rewriteWithDiarization(segments: segments)
+                    await transcriptLogger.rewriteWithDiarization(diarization, sessionID: sessionID)
+                    diarized = true
                 }
+            }
+            if !diarized {
+                // Nothing to attribute — don't leave the reader with bare "Them".
+                await transcriptLogger.collapseUnattributedSpeakers(sessionID: sessionID)
             }
 
             transcriptionEngine?.assetStatus = "Finalizing..."
-            let savedPath = await transcriptLogger.finalizeFrontmatter()
+            let savedPath = await transcriptLogger.finalizeFrontmatter(sessionID: sessionID)
             transcriptionEngine?.assetStatus = "Ready"
 
             if activeSessionType == nil, let savedPath {

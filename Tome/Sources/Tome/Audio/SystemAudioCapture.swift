@@ -13,12 +13,25 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
 
     // Temp WAV for diarization
     private let _bufferFilePath = OSAllocatedUnfairLock<URL?>(uncheckedState: nil)
-    var bufferFilePath: URL? { _bufferFilePath.withLock { $0 } }
+
+    /// Wall-clock instant of the first sample written to the buffer WAV. The
+    /// diarizer reports segment times relative to the start of that file, which
+    /// is *not* the start of the session: the models load first, then
+    /// ScreenCaptureKit takes a moment to deliver its first callback. Whoever
+    /// maps diarized segments onto transcript timestamps must anchor to this.
+    private let _bufferStartWallClock = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
 
     private let _audioFileWriter = OSAllocatedUnfairLock<AVAudioFile?>(uncheckedState: nil)
 
     struct CaptureStreams {
         let systemAudio: AsyncStream<AVAudioPCMBuffer>
+    }
+
+    /// A finished recording handed off for diarization, with the anchor its
+    /// segment times will be relative to.
+    struct BufferedAudio: Sendable {
+        let url: URL
+        let startWallClock: Date
     }
 
     /// Start capturing system audio. Pass a bundle ID to filter to a specific app.
@@ -42,7 +55,12 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             filter = SCContentFilter(display: display, excludingWindows: [])
         }
 
-        // Set up audio buffer file for post-session diarization
+        // Set up audio buffer file for post-session diarization. Drop any buffer
+        // from a previous session that was never handed off (voice memos never
+        // diarize) so temp WAVs don't pile up.
+        if let stale = takeBufferPath() {
+            try? FileManager.default.removeItem(at: stale)
+        }
         let bufferURL = FileManager.default.temporaryDirectory.appendingPathComponent("tome_sys_audio_\(UUID().uuidString).wav")
         _bufferFilePath.withLock { $0 = bufferURL }
         _audioFileWriter.withLock { $0 = nil } // will be created on first audio callback
@@ -79,12 +97,37 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         _audioLevel.value = 0
     }
 
-    /// Remove the buffered audio file after diarization is complete
-    func cleanupBufferFile() {
-        if let path = _bufferFilePath.withLock({ $0 }) {
-            try? FileManager.default.removeItem(at: path)
+    /// Hand the buffered WAV to the caller, which becomes responsible for
+    /// deleting it via `removeBuffer(_:)`. Detaching drops our reference, so a
+    /// session starting while diarization runs can neither overwrite nor delete
+    /// the file being processed.
+    func detachBuffer() -> BufferedAudio? {
+        let path = takeBufferPath()
+        let startWallClock = _bufferStartWallClock.withLock { clock -> Date? in
+            let value = clock
+            clock = nil
+            return value
         }
-        _bufferFilePath.withLock { $0 = nil }
+        guard let path else { return nil }
+        // No wall clock means no audio callback ever fired: nothing to diarize.
+        guard let startWallClock, FileManager.default.fileExists(atPath: path.path) else {
+            try? FileManager.default.removeItem(at: path)
+            return nil
+        }
+        return BufferedAudio(url: path, startWallClock: startWallClock)
+    }
+
+    /// Remove a buffered audio file after diarization is complete.
+    func removeBuffer(_ audio: BufferedAudio) {
+        try? FileManager.default.removeItem(at: audio.url)
+    }
+
+    private func takeBufferPath() -> URL? {
+        _bufferFilePath.withLock { path -> URL? in
+            let value = path
+            path = nil
+            return value
+        }
     }
 
     // MARK: - SCStreamOutput
@@ -128,6 +171,10 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             if writer == nil, let bufferPath = self._bufferFilePath.withLock({ $0 }) {
                 let wavFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
                 writer = try? AVAudioFile(forWriting: bufferPath, settings: wavFormat.settings)
+                if writer != nil {
+                    // t=0 of the diarizer's timeline.
+                    self._bufferStartWallClock.withLock { $0 = Date() }
+                }
             }
             try? writer?.write(from: pcmBuffer)
         }

@@ -17,6 +17,11 @@ continuación.
   auto-start no quede bloqueado pidiendo reinicio.
 - **Vocabulario personalizado** — correcciones (`patrón = reemplazo`) y términos
   para arreglar nombres y jerga en los transcripts. Ver [`VOCABULARY.md`](VOCABULARY.md).
+- **Diarización que llega al transcript** — pyannote separaba las voces desde el
+  principio, pero el resultado se descartaba por un desajuste de etiqueta entre el
+  writer en vivo y el reescritor post-sesión. Arreglado junto al origen de tiempos
+  del WAV, el frontmatter que mentía, la reescritura sobre el fichero equivocado y
+  los `stopSession` reentrantes. Ver [`CHANGES-diarization-fix.md`](CHANGES-diarization-fix.md).
 
 ## Próximo
 
@@ -37,6 +42,51 @@ contexto lo que las reglas no escalan a cubrir.
 - **Trade-off:** un modelo local pequeño no iguala a uno frontier en pulido; es el
   precio de que nada salga del Mac.
 
+### Atribución fina de speakers en cross-talk (prioridad baja — medir antes)
+
+El sello de tiempo de cada línea del transcript es el instante en que la ASR
+**terminó** de transcribir, no cuando se habló, y `StreamingTranscriber`
+(`flushInterval`) corta cada 30 s. En intervenciones largas el sello puede ir muy
+por detrás del habla, y cuando varias voces caen en el mismo chunk la línea
+entera recibe una sola etiqueta.
+
+**Coste real medido** en la reunión de validación (5-ago, 23 min, 4 personas): 1
+línea de 70 — la despedida a tres voces. Las otras 7 líneas fallidas son
+monosílabos (`Vale`, `Mm-hmm`) que ninguna mejora de timing rescata, porque el
+problema ahí es que pyannote no los segmenta.
+
+> **Antes de tocar nada: grabar 2-3 reuniones más.** Con una sola sesión no se
+> sabe si el ~90 % de cobertura es lo normal o suerte. Sería una pena operar sobre
+> el writer en vivo para arreglar un problema que resulta ser marginal.
+
+Plan, si los datos lo justifican:
+
+1. **Reloj de muestras en `StreamingTranscriber`** — contar las muestras
+   consumidas del stream y registrar el offset en `speechStart` y en cada flush,
+   para tener el intervalo `[inicio, fin]` real de cada intervención en segundos
+   de audio. El escritor del WAV y el transcriptor consumen la *misma* secuencia
+   de callbacks de ScreenCaptureKit y el `AsyncStream` no descarta buffers, así
+   que esos offsets comparten origen con la línea temporal del diarizador. El
+   ancla de reloj de pared pasaría a ser fallback.
+2. **Propagar el intervalo** por `Utterance` → `TranscriptStore` →
+   `ContentView.handleNewUtterance` → `TranscriptLogger.append`, y cambiar el
+   matching de "¿el instante cae dentro del segmento? si no, el midpoint más
+   cercano a <10 s" por **solape máximo de intervalos**. El markdown no cambia:
+   los intervalos viven solo en memoria, que basta porque la reescritura ocurre en
+   la misma ejecución.
+3. **Partir el chunk donde cambia el speaker dominante.**
+   **`ASRResult.tokenTimings` ya trae `startTime`/`endTime` por token** y
+   `AsrManager+Transcription.swift` lo rellena siempre en la ruta que usamos
+   (`transcribe(samples, source:)`). Es decir: el alineamiento word-level que el
+   análisis original apuntaba como "robar de WhisperX" **ya está en el motor que
+   corre**. No hace falta wav2vec2 ni migrar de app.
+
+**Opción barata alternativa**: bajar `flushInterval` de `480_000` (30 s) a
+`160_000` (10 s) en `StreamingTranscriber`. Una constante. Acerca el sello al
+habla y reduce el solape por chunk, a cambio de menos contexto para Parakeet —el
+propio comentario del código dice que los chunks largos le dan mejor precisión,
+así que es un intercambio real. Mitiga el problema, no lo arregla.
+
 ## Otras mejoras candidatas
 
 ### Vocabulario
@@ -55,4 +105,21 @@ contexto lo que las reglas no escalan a cubrir.
 
 ### Salida / vault
 - **Plantilla de frontmatter configurable** desde Settings.
+- **`Them` no debería contar como asistente** — hoy las líneas sin atribuir dejan
+  `Them` en `attendees:` y en `**Speakers:**`. Es honesto sobre la cobertura, pero
+  confunde al paso de poner nombres reales cruzando con el calendario. Candidato:
+  excluirlo del conteo y de la lista, dejándolo solo en el cuerpo.
+- **La duración se pasa unos segundos** — `finalizeFrontmatter` mide con `Date()` y
+  corre después de la diarización, así que le suma el tiempo de proceso (18 s sobre
+  23 min en la reunión de validación). Arreglo trivial: usar el instante de
+  `endSession`.
+- **Numerar los speakers por orden de aparición** — hoy `Speaker 2/3/4` sale del
+  orden del array de segmentos de pyannote, que no está verificado que sea
+  cronológico (en la reunión de validación `Speaker 2` es la última línea del
+  fichero). Numerar por el `startTime` más temprano de cada voz haría las etiquetas
+  intuitivas.
+- **Aviso en UI cuando no hay audio de sistema** — `[DIARIZE] No buffered system
+  audio file found` y los `[ENGINE-5-FAIL]` de TCC solo se ven en el log. Tras
+  refirmar la app (ad-hoc cambia la identidad de código) macOS revoca el permiso de
+  grabación de pantalla y la sesión graba sin la otra parte, en silencio.
 - Contexto de cliente pre-llamada (estilo Detto) — *descartado por ahora*.

@@ -20,12 +20,15 @@ actor TranscriptLogger {
     private var sourceApp: String = "manual"
     private var sessionContext: String = ""
     private var utteranceBuffer: [(speaker: String, text: String, timestamp: Date)] = []
-    private var speakerCounter: Int = 1  // starts at 1, "You" is implicit
 
-    // Map from raw speaker identity to display label
-    private var speakerLabels: [String: String] = [:]
+    // Monotonic session IDs. Post-session work (diarization, frontmatter) runs
+    // long enough that a new session can start meanwhile — every such call
+    // carries the ID it was issued for so it can't write into the wrong file.
+    private var sessionCounter: Int = 0
+    private var currentSessionID: Int?
 
     // Retained from last session for post-session diarization and frontmatter finalization
+    private var lastSessionID: Int?
     private var lastSessionFilePath: URL?
     private var lastSessionStartTime: Date?
     private var lastSpeakersDetected: Set<String> = []
@@ -39,8 +42,6 @@ actor TranscriptLogger {
         self.sourceApp = sourceApp
         self.sessionStartTime = Date()
         self.speakersDetected = []
-        self.speakerLabels = [:]
-        self.speakerCounter = 1
         self.sessionContext = ""
         self.utteranceBuffer = []
 
@@ -106,6 +107,9 @@ tags:
         guard created else { throw TranscriptLoggerError.cannotCreateFile(currentFilePath!.path) }
         fileHandle = try FileHandle(forWritingTo: currentFilePath!)
         fileHandle?.seekToEndOfFile()
+
+        sessionCounter += 1
+        currentSessionID = sessionCounter
     }
 
     func append(speaker: String, text: String, timestamp: Date) {
@@ -177,7 +181,17 @@ tags:
         fileHandle?.seekToEndOfFile()
     }
 
-    func endSession() {
+    /// Closes the transcript and returns the ID of the session just ended, to be
+    /// passed to `rewriteWithDiarization` / `collapseUnattributedSpeakers` /
+    /// `finalizeFrontmatter`. Returns nil when there was no active session — a
+    /// duplicated stop must not clear the retained state that post-session work
+    /// still needs.
+    func endSession() -> Int? {
+        guard let sessionID = currentSessionID else {
+            diagLog("[LOGGER] endSession called with no active session — ignoring")
+            return nil
+        }
+
         // Flush remaining buffer
         flushBuffer()
 
@@ -186,27 +200,32 @@ tags:
         fileHandle = nil
 
         // Retain for post-session diarization and frontmatter finalization
+        lastSessionID = sessionID
         lastSessionFilePath = currentFilePath
         lastSessionStartTime = sessionStartTime
         lastSpeakersDetected = speakersDetected
         lastSessionContext = sessionContext
 
         // Reset state immediately so next session can start
+        currentSessionID = nil
         currentFilePath = nil
         sessionStartTime = nil
         speakersDetected = []
         sessionContext = ""
-        speakerLabels = [:]
-        speakerCounter = 1
 
         // Frontmatter rewrite is NOT called here — caller must call
         // finalizeFrontmatter() AFTER diarization completes to avoid race.
+        return sessionID
     }
 
     /// Call AFTER diarization is complete. Rewrites frontmatter with correct
     /// duration, speaker count, attendees, and optionally renames the file.
     @discardableResult
-    func finalizeFrontmatter() async -> URL? {
+    func finalizeFrontmatter(sessionID: Int) async -> URL? {
+        guard sessionID == lastSessionID else {
+            diagLog("[LOGGER] finalizeFrontmatter for stale session \(sessionID) — ignoring")
+            return nil
+        }
         guard let filePath = lastSessionFilePath,
               let startTime = lastSessionStartTime else { return nil }
 
@@ -232,6 +251,7 @@ tags:
         }
 
         let savedPath = lastSessionFilePath
+        lastSessionID = nil
         lastSessionStartTime = nil
         lastSpeakersDetected = []
         lastSessionContext = ""
@@ -305,25 +325,33 @@ tags:
         }
     }
 
-    /// Rewrite the transcript file, replacing "Them" labels with diarized speaker IDs.
-    /// Segments are (speakerId, startTimeSeconds, endTimeSeconds) from the offline diarizer.
-    func rewriteWithDiarization(segments: [(speakerId: String, startTime: Float, endTime: Float)]) {
-        guard let filePath = currentFilePath ?? lastSessionFilePath else { return }
+    /// Rewrite the transcript file, replacing the live "Them" labels with diarized
+    /// speaker IDs. Lines the diarizer can't account for are left as "Them", so
+    /// the transcript shows its real coverage instead of hiding gaps behind a
+    /// plausible-looking speaker number.
+    func rewriteWithDiarization(_ diarization: PostSessionDiarization, sessionID: Int) {
+        guard sessionID == lastSessionID else {
+            diagLog("[DIARIZE] rewrite for stale session \(sessionID) — ignoring")
+            return
+        }
+        guard let filePath = lastSessionFilePath else { return }
+        let segments = diarization.segments
+        guard !segments.isEmpty else { return }
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
 
         // Build a map of unique diarization speaker IDs → friendly labels (Speaker 2, 3, etc.)
         var diarSpeakerMap: [String: String] = [:]
         var nextSpeakerNum = 2
-        for seg in segments {
-            if diarSpeakerMap[seg.speakerId] == nil {
-                diarSpeakerMap[seg.speakerId] = "Speaker \(nextSpeakerNum)"
-                nextSpeakerNum += 1
-            }
+        for seg in segments where diarSpeakerMap[seg.speakerId] == nil {
+            diarSpeakerMap[seg.speakerId] = "Speaker \(nextSpeakerNum)"
+            nextSpeakerNum += 1
         }
 
-        // Parse transcript lines and re-attribute "Them" utterances based on timestamp overlap
-        let timeFmt = DateFormatter()
-        timeFmt.dateFormat = "HH:mm:ss"
+        // Segment times are relative to the first buffered audio sample, which
+        // lands seconds *after* the session starts (models load first, then
+        // ScreenCaptureKit warms up). Anchoring to the session start instead
+        // would shift every attribution by that gap.
+        let anchorSeconds = Self.secondsSinceMidnight(diarization.audioStartWallClock)
 
         // For each "**Them** (HH:mm:ss)" line, find the best matching diarization segment
         let pattern = #"\*\*Them\*\* \((\d{2}:\d{2}:\d{2})\)"#
@@ -332,23 +360,16 @@ tags:
         let nsContent = content as NSString
         let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsContent.length))
 
+        var appliedLabels: Set<String> = []
+        var unattributed = 0
+
         // Process in reverse so range offsets stay valid
         for match in matches.reversed() {
-            let timeRange = match.range(at: 1)
-            let timeStr = nsContent.substring(with: timeRange)
-
-            // Parse the timestamp relative to session start
-            guard let sessionStart = sessionStartTime ?? lastSessionStartTime else { continue }
-            guard let utteranceDate = timeFmt.date(from: timeStr) else { continue }
-
-            // Calculate seconds from session start (timestamps are clock times on the same day)
-            let calendar = Calendar.current
-            let startComponents = calendar.dateComponents([.hour, .minute, .second], from: sessionStart)
-            let uttComponents = calendar.dateComponents([.hour, .minute, .second], from: utteranceDate)
-
-            let startSeconds = (startComponents.hour ?? 0) * 3600 + (startComponents.minute ?? 0) * 60 + (startComponents.second ?? 0)
-            let uttSeconds = (uttComponents.hour ?? 0) * 3600 + (uttComponents.minute ?? 0) * 60 + (uttComponents.second ?? 0)
-            let offsetSeconds = Float(uttSeconds - startSeconds)
+            let timeStr = nsContent.substring(with: match.range(at: 1))
+            guard let offsetSeconds = Self.offsetSeconds(fromClockTime: timeStr, anchorSeconds: anchorSeconds) else {
+                unattributed += 1
+                continue
+            }
 
             // Find best matching segment
             var bestMatch: String?
@@ -372,39 +393,72 @@ tags:
                 }
             }
 
-            if let label = bestMatch {
-                let fullRange = match.range(at: 0)
-                let replacement = "**\(label)** (\(timeStr))"
-                content = (content as NSString).replacingCharacters(in: fullRange, with: replacement)
+            guard let label = bestMatch else {
+                unattributed += 1
+                continue
             }
+            appliedLabels.insert(label)
+            content = (content as NSString).replacingCharacters(
+                in: match.range(at: 0),
+                with: "**\(label)** (\(timeStr))"
+            )
         }
 
-        // Update speaker count in header and frontmatter
-        let allSpeakers = Set(diarSpeakerMap.values).union(["You"])
-        if let range = content.range(of: #"\*\*Speakers:\*\* \d+"#, options: .regularExpression) {
-            content.replaceSubrange(range, with: "**Speakers:** \(allSpeakers.count)")
-        }
+        diagLog("[DIARIZE] Rewrote \(matches.count - unattributed)/\(matches.count) lines as \(appliedLabels.count) speakers, \(unattributed) left as Them")
 
-        // Atomic write
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_diar_tmp.md")
+        // Feed the diarized labels back so finalizeFrontmatter() — which runs
+        // after this and rewrites the same fields — reports what's actually in
+        // the body instead of the live You/Them pair.
+        var speakers = appliedLabels
+        if content.contains("**You** (") { speakers.insert("You") }
+        if unattributed > 0 { speakers.insert("Them") }
+        lastSpeakersDetected = speakers
+
+        Self.writeAtomically(content, to: filePath, tmpName: ".tome_diar_tmp.md")
+    }
+
+    /// Fallback for sessions that were never diarized (voice memos) or where
+    /// diarization produced nothing: collapse the live "Them" labels to
+    /// "Speaker 2" so the transcript still reads as a two-party conversation.
+    func collapseUnattributedSpeakers(sessionID: Int) {
+        guard sessionID == lastSessionID else { return }
+        guard let filePath = lastSessionFilePath,
+              let content = try? String(contentsOf: filePath, encoding: .utf8),
+              content.contains("**Them** (") else { return }
+
+        let collapsed = content.replacingOccurrences(of: "**Them** (", with: "**Speaker 2** (")
+        lastSpeakersDetected.remove("Them")
+        lastSpeakersDetected.insert("Speaker 2")
+        Self.writeAtomically(collapsed, to: filePath, tmpName: ".tome_diar_tmp.md")
+    }
+
+    /// Transcript timestamps carry no date, so both sides of the comparison are
+    /// reduced to a time of day.
+    private static func secondsSinceMidnight(_ date: Date) -> Int {
+        let c = Calendar.current.dateComponents([.hour, .minute, .second], from: date)
+        return (c.hour ?? 0) * 3600 + (c.minute ?? 0) * 60 + (c.second ?? 0)
+    }
+
+    private static func offsetSeconds(fromClockTime timeStr: String, anchorSeconds: Int) -> Float? {
+        let parts = timeStr.split(separator: ":").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        var offset = parts[0] * 3600 + parts[1] * 60 + parts[2] - anchorSeconds
+        if offset < -43_200 { offset += 86_400 }  // session ran across midnight
+        return Float(offset)
+    }
+
+    private static func writeAtomically(_ content: String, to filePath: URL, tmpName: String) {
+        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(tmpName)
         try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
         try? FileManager.default.removeItem(at: filePath)
         try? FileManager.default.moveItem(at: tmpPath, to: filePath)
     }
 
+    /// The live writer can only tell "me" from "not me", so everything coming off
+    /// the system audio stays "Them". Splitting it into Speaker 2/3/4 is
+    /// `rewriteWithDiarization`'s job, and it looks for exactly this label —
+    /// assigning speaker numbers here is what used to make it match nothing.
     private func labelForSpeaker(_ rawSpeaker: String) -> String {
-        // "You" always maps to "You"
-        if rawSpeaker.lowercased() == "you" { return "You" }
-
-        // Check if we already assigned a label
-        if let existing = speakerLabels[rawSpeaker] {
-            return existing
-        }
-
-        // Assign new label
-        speakerCounter += 1
-        let label = "Speaker \(speakerCounter)"
-        speakerLabels[rawSpeaker] = label
-        return label
+        rawSpeaker.lowercased() == "you" ? "You" : "Them"
     }
 }
