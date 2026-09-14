@@ -423,7 +423,7 @@ struct ContentView: View {
 
         Task {
             await transcriptionEngine?.stop()
-            await sessionStore.endSession()
+            let endedSessionFile = await sessionStore.endSession()
             let endedSessionID = await transcriptLogger.endSession()
 
             // Teardown is done; release the guard here rather than after the
@@ -433,6 +433,15 @@ struct ContentView: View {
             // file.
             isStopping = false
             guard let sessionID = endedSessionID else { return }
+
+            // A session that recorded nothing and lasted under a minute is a
+            // detector false start, not a meeting. Drop both its files rather
+            // than leaving an empty transcript and an empty .jsonl behind.
+            if await transcriptLogger.discardIfEmpty(sessionID: sessionID, shorterThan: 60) {
+                if let endedSessionFile { await sessionStore.discard(endedSessionFile) }
+                transcriptionEngine?.assetStatus = "Ready"
+                return
+            }
 
             var diarized = false
             if wasCallCapture {

@@ -38,10 +38,19 @@ actor SessionStore {
         }
     }
 
-    func endSession() {
+    /// Closes the session file and returns its URL, so a caller that decides the
+    /// session was a false start can delete it.
+    @discardableResult
+    func endSession() -> URL? {
         try? fileHandle?.close()
         fileHandle = nil
+        let ended = currentFile
         currentFile = nil
+        return ended
+    }
+
+    func discard(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
     }
 
     var sessionsDirectoryURL: URL { sessionsDirectory }

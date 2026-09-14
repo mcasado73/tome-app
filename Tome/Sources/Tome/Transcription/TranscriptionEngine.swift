@@ -4,6 +4,12 @@ import FluidAudio
 import Observation
 import os
 
+// Serializes diagLog writes. `seekToEndOfFile` + `write` is not atomic, and the
+// audio tap callbacks, the meeting detector and the MainActor all log
+// concurrently — which interleaved partial lines into the file and mangled
+// roughly one line in 240.
+private let diagLogLock = NSLock()
+
 // Writes to /tmp/tome.log, rotating to /tmp/tome.log.1 once the file grows past
 // ~5 MB (keeps one backup, so total on-disk footprint stays ~10 MB).
 func diagLog(_ msg: String) {
@@ -11,6 +17,10 @@ func diagLog(_ msg: String) {
     let path = "/tmp/tome.log"
     let maxBytes: UInt64 = 5 * 1024 * 1024
     guard let data = line.data(using: .utf8) else { return }
+
+    diagLogLock.lock()
+    defer { diagLogLock.unlock() }
+
     if let fh = FileHandle(forWritingAtPath: path) {
         let size = fh.seekToEndOfFile()
         if size > maxBytes {
@@ -61,9 +71,20 @@ final class TranscriptionEngine {
     private var sysTask: Task<Void, Never>?
     /// Keeps the mic stream alive for the audio level meter when transcription isn't running.
     private var micKeepAliveTask: Task<Void, Never>?
-    /// Fires 15s after a successful start to detect zombie sessions where the
-    /// audio engine hung silently inside CoreAudio.
+    /// Polls mic tap liveness for as long as the session runs, so a tap that
+    /// never starts — or stops delivering mid-session — gets rebound instead of
+    /// silently costing us the "you" channel.
     private var watchdogTask: Task<Void, Never>?
+    /// Coalesces the burst of `kAudioHardwarePropertyDefaultInputDevice`
+    /// notifications Bluetooth devices emit — AirPods fire 8–16 within the same
+    /// second — so the mic is torn down once, after the transition settles,
+    /// rather than in the middle of it.
+    private var micSwapDebounceTask: Task<Void, Never>?
+
+    /// Interval between mic liveness checks.
+    private static let watchdogInterval = Duration.seconds(15)
+    /// How long the default-input burst is allowed to settle before we act.
+    private static let micSwapDebounce = Duration.seconds(1)
 
     /// Shared FluidAudio instances
     private var asrManager: AsrManager?
@@ -159,31 +180,7 @@ final class TranscriptionEngine {
         // 4. Start mic transcription
         let store = transcriptStore
         let corrector = vocabularyCorrector
-        let micTranscriber = StreamingTranscriber(
-            asrManager: asrManager,
-            vadManager: micVadManager,
-            speaker: .you,
-            audioSource: .microphone,
-            onPartial: { text in
-                Task { @MainActor in store.volatileYouText = text }
-            },
-            onFinal: { text in
-                let corrected = corrector?.apply(text) ?? text
-                Task { @MainActor in
-                    store.volatileYouText = ""
-                    store.append(Utterance(text: corrected, speaker: .you))
-                }
-            }
-        )
-        let reportMicError: @Sendable (String) -> Void = { [weak self] msg in
-            Task { @MainActor in self?.lastError = msg }
-        }
-        micTask = Task.detached {
-            let hadFatalError = await micTranscriber.run(stream: micStream)
-            if hadFatalError {
-                reportMicError("Mic transcription failed — restart session")
-            }
-        }
+        micTask = makeMicTask(stream: micStream, asrManager: asrManager, vadManager: micVadManager)
 
         // 5. Start system audio transcription
         if let sysStream = sysStreams?.systemAudio {
@@ -220,55 +217,22 @@ final class TranscriptionEngine {
         // Install CoreAudio listener for default input device changes
         installDefaultDeviceListener()
 
-        // Startup watchdog: if no mic tap callback fires within 15s, the audio
-        // engine startup likely hung inside CoreAudio (we saw this on
-        // macOS 26.4 — `installTap` never returns and the session becomes a
-        // zombie). Abort the session cleanly so the user can restart without
-        // crashing the app on the next button press.
-        watchdogTask?.cancel()
-        watchdogTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(15))
-            guard !Task.isCancelled, let self else { return }
-            guard self.isRunning else { return }
-            if self.micCapture.tapCallCount == 0 {
-                diagLog("[ENGINE-WATCHDOG] no mic tap activity 15s after start — aborting zombie session")
-                await self.stop()
-                self.lastError = "Audio capture stalled — please restart the session"
-            }
-        }
+        startMicWatchdog()
     }
 
-    /// Restart only the mic capture with a new device, keeping system audio and models intact.
-    /// Pass the raw setting value (0 = system default, or a specific AudioDeviceID).
-    func restartMic(inputDeviceID: AudioDeviceID) {
-        guard isRunning, let asrManager, let micVadManager else { return }
+    // MARK: - Mic Pipeline
 
-        // Only update user selection when explicitly changed (not from OS listener)
-        if inputDeviceID != 0 || userSelectedDeviceID != 0 {
-            userSelectedDeviceID = inputDeviceID
-        }
-        let targetMicID = inputDeviceID > 0 ? inputDeviceID : MicCapture.defaultInputDeviceID() ?? 0
-        guard targetMicID != currentMicDeviceID else {
-            diagLog("[ENGINE-MIC-SWAP] same device \(targetMicID), skipping")
-            return
-        }
-
-        diagLog("[ENGINE-MIC-SWAP] switching mic from \(currentMicDeviceID) to \(targetMicID)")
-
-        // Tear down old mic
-        micTask?.cancel()
-        micTask = nil
-        micCapture.stop()
-
-        currentMicDeviceID = targetMicID
-
-        // Start new mic stream
-        let micStream = micCapture.bufferStream(deviceID: targetMicID)
+    /// Builds the mic `StreamingTranscriber` and the task that drives it.
+    private func makeMicTask(
+        stream: sending AsyncStream<AVAudioPCMBuffer>,
+        asrManager: AsrManager,
+        vadManager: VadManager
+    ) -> Task<Void, Never> {
         let store = transcriptStore
         let corrector = vocabularyCorrector
         let micTranscriber = StreamingTranscriber(
             asrManager: asrManager,
-            vadManager: micVadManager,
+            vadManager: vadManager,
             speaker: .you,
             audioSource: .microphone,
             onPartial: { text in
@@ -285,14 +249,103 @@ final class TranscriptionEngine {
         let reportMicError: @Sendable (String) -> Void = { [weak self] msg in
             Task { @MainActor in self?.lastError = msg }
         }
-        micTask = Task.detached {
-            let hadFatalError = await micTranscriber.run(stream: micStream)
+        return Task.detached {
+            let hadFatalError = await micTranscriber.run(stream: stream)
             if hadFatalError {
                 reportMicError("Mic transcription failed — restart session")
             }
         }
+    }
 
+    /// Tears down the current mic pipeline and rebuilds it on `deviceID`,
+    /// leaving system audio and the loaded models untouched.
+    private func rebindMic(to deviceID: AudioDeviceID) {
+        guard let asrManager, let micVadManager else { return }
+
+        micTask?.cancel()
+        micTask = nil
+        micCapture.stop()
+
+        currentMicDeviceID = deviceID
+        // 0 means "no explicit device": let MicCapture fall back to the system
+        // default rather than asking CoreAudio to bind to device ID 0.
+        let micStream = micCapture.bufferStream(deviceID: deviceID > 0 ? deviceID : nil)
+        micTask = makeMicTask(stream: micStream, asrManager: asrManager, vadManager: micVadManager)
+    }
+
+    /// Restart only the mic capture with a new device, keeping system audio and models intact.
+    /// Pass the raw setting value (0 = system default, or a specific AudioDeviceID).
+    func restartMic(inputDeviceID: AudioDeviceID) {
+        guard isRunning, asrManager != nil, micVadManager != nil else { return }
+
+        // Only update user selection when explicitly changed (not from OS listener)
+        if inputDeviceID != 0 || userSelectedDeviceID != 0 {
+            userSelectedDeviceID = inputDeviceID
+        }
+        let targetMicID = inputDeviceID > 0 ? inputDeviceID : MicCapture.defaultInputDeviceID() ?? 0
+        guard targetMicID != currentMicDeviceID else {
+            diagLog("[ENGINE-MIC-SWAP] same device \(targetMicID), skipping")
+            return
+        }
+
+        diagLog("[ENGINE-MIC-SWAP] switching mic from \(currentMicDeviceID) to \(targetMicID)")
+        rebindMic(to: targetMicID)
         diagLog("[ENGINE-MIC-SWAP] mic restarted on device \(targetMicID)")
+    }
+
+    // MARK: - Mic Watchdog
+
+    /// Samples the mic tap counter for as long as the session runs.
+    ///
+    /// Two failures look identical from here and both cost us the "you"
+    /// channel with no error anywhere: `installTap`/`engine.start` hanging
+    /// inside CoreAudio at startup (the macOS 26.4 zombie session), and a tap
+    /// that stops delivering mid-session after a Bluetooth input renegotiates
+    /// its format. On the first stall we rebind the mic; only if that doesn't
+    /// bring it back do we abort the session, which is the original behaviour.
+    private func startMicWatchdog() {
+        watchdogTask?.cancel()
+        watchdogTask = Task { [weak self] in
+            var lastCount = 0
+            var stalls = 0
+
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.watchdogInterval)
+                guard !Task.isCancelled, let self, self.isRunning else { return }
+
+                let count = self.micCapture.tapCallCount
+
+                // Any movement counts as alive. `bufferStream` restarts the
+                // counter, so a sample *below* the last one means the stream was
+                // replaced — a device swap, or our own rebind below — rather
+                // than that the tap died; take it as the new baseline and let
+                // the next tick catch it if the replacement is dead too.
+                if count != lastCount {
+                    lastCount = count
+                    stalls = 0
+                    continue
+                }
+
+                stalls += 1
+                let reason = count == 0 ? "no mic tap activity" : "mic tap stalled at #\(count)"
+
+                guard stalls > 1 else {
+                    diagLog("[ENGINE-WATCHDOG] \(reason) — rebinding mic")
+                    if let captureError = self.micCapture.captureError {
+                        diagLog("[ENGINE-WATCHDOG] last capture error: \(captureError)")
+                    }
+                    self.rebindMic(to: self.currentMicDeviceID)
+                    // The rebind resets the tap counter.
+                    lastCount = 0
+                    continue
+                }
+
+                diagLog("[ENGINE-WATCHDOG] \(reason) after rebind — aborting zombie session")
+                await self.stop()
+                self.lastError = "Audio capture stalled — please restart the session"
+                return
+            }
+        }
     }
 
     // MARK: - Default Device Listener
@@ -311,7 +364,7 @@ final class TranscriptionEngine {
             Task { @MainActor in
                 guard self.isRunning, self.userSelectedDeviceID == 0 else { return }
                 // User has "System Default" selected — follow the OS default
-                self.restartMic(inputDeviceID: 0)
+                self.scheduleMicSwap(inputDeviceID: 0)
             }
         }
         defaultDeviceListenerBlock = block
@@ -322,6 +375,19 @@ final class TranscriptionEngine {
             DispatchQueue.main,
             block
         )
+    }
+
+    /// Defers a device-driven mic swap, restarting the timer on every further
+    /// notification in the burst. A switch to AirPods emits a dozen of these
+    /// within the same second, and acting on the first one tears the tap down
+    /// while CoreAudio is still renegotiating the hardware format.
+    private func scheduleMicSwap(inputDeviceID: AudioDeviceID) {
+        micSwapDebounceTask?.cancel()
+        micSwapDebounceTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.micSwapDebounce)
+            guard !Task.isCancelled, let self, self.isRunning else { return }
+            self.restartMic(inputDeviceID: inputDeviceID)
+        }
     }
 
     private func removeDefaultDeviceListener() {
@@ -367,6 +433,8 @@ final class TranscriptionEngine {
         removeDefaultDeviceListener()
         watchdogTask?.cancel()
         watchdogTask = nil
+        micSwapDebounceTask?.cancel()
+        micSwapDebounceTask = nil
         micTask?.cancel()
         sysTask?.cancel()
         micKeepAliveTask?.cancel()

@@ -29,7 +29,15 @@ final class MeetingDetector {
 
     /// How long to wait after the conferencing app releases the mic before
     /// signaling stop (seconds). Absorbs brief mutes / device switches.
-    private let stopDelay: UInt64 = 20
+    ///
+    /// Teams drops the input device whenever you mute, and again while moving
+    /// from the join screen into the room. At 20s that split single meetings
+    /// across two transcripts — and produced an empty one for the join blip.
+    private let stopDelay: UInt64 = 45
+
+    /// Last logged snapshot of who holds the mic, so the 2s poll only writes a
+    /// line when the picture actually changes.
+    private var lastInputSummary: String?
 
     /// Known conferencing bundle IDs, matched by *prefix* (see `conferencingName`)
     /// so helper processes that actually own the mic also count — e.g. the new
@@ -193,8 +201,14 @@ final class MeetingDetector {
                 match = (bid, confName)
             }
         }
-        if !activeSummary.isEmpty {
-            diagLog("[MEETING-DETECT] processes with input active: \(activeSummary.joined(separator: " | ")) → match=\(match?.name ?? "none")")
+        // This runs every 2s. Logging it unconditionally produced ~15k lines in
+        // two days, which rotated the 5 MB diag log within hours and destroyed
+        // the history right when it was needed. Log only when the picture
+        // actually changes.
+        let summary = "\(activeSummary.joined(separator: " | ")) → match=\(match?.name ?? "none")"
+        if !activeSummary.isEmpty && summary != lastInputSummary {
+            lastInputSummary = summary
+            diagLog("[MEETING-DETECT] processes with input active: \(summary)")
         }
         return match
     }

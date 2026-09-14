@@ -71,13 +71,25 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         config.channelCount = 1
         config.sampleRate = 48000
 
-        // Minimal video — we only want audio
+        // Minimal video — we only want audio. ScreenCaptureKit always runs a
+        // video stream, so the cheapest configuration is a 2x2 frame as rarely
+        // as it will accept: at 1 fps this logged
+        // "stream output NOT found. Dropping frame" 3,600 times an hour.
         config.width = 2
         config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        config.minimumFrameInterval = CMTime(value: 60, timescale: 1)
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: self)
         try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
+        // Register a screen output too. Without one, SCK treats every video
+        // frame it produces as undeliverable and logs an error for it; our
+        // handler discards non-audio buffers, so this just stops the noise.
+        // Never fatal: losing the noise suppression must not cost us the audio.
+        do {
+            try scStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global(qos: .utility))
+        } catch {
+            diagLog("[SYS-FILTER] screen output not registered (\(error.localizedDescription)) — video frames will log drops")
+        }
 
         let sysStream = AsyncStream<AVAudioPCMBuffer> { cont in
             self._sysContinuation.withLock { $0 = cont }
