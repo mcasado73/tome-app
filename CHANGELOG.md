@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.3.0] — 2026-09-17
 
 ### Auto-start on meeting detection
 - Transcription starts and stops on its own when a conferencing app takes the microphone, watched through CoreAudio's per-process input state (Teams, Zoom, Webex, Slack, FaceTime, browsers)
