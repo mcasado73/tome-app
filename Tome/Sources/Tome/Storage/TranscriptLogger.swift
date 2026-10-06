@@ -28,29 +28,33 @@ actor TranscriptLogger {
     /// meeting is under 100 KB of text, so this is cheap insurance.
     private var sessionUtterances: [(speaker: String, text: String, timestamp: Date)] = []
 
-    /// Utterance count of the session that just ended, used to spot the
-    /// meeting-detector false starts that produce a transcript with no content.
-    private var lastUtteranceCount = 0
-
-    /// The ended session's utterances and header inputs, retained so the
-    /// post-session work can also rebuild a transcript that disappears during
-    /// diarization — which runs for minutes on a long meeting.
-    private var lastSessionUtterances: [(speaker: String, text: String, timestamp: Date)] = []
-    private var lastSourceApp: String = "manual"
-    private var lastSessionType: SessionType = .callCapture
-
     // Monotonic session IDs. Post-session work (diarization, frontmatter) runs
     // long enough that a new session can start meanwhile — every such call
     // carries the ID it was issued for so it can't write into the wrong file.
     private var sessionCounter: Int = 0
     private var currentSessionID: Int?
 
-    // Retained from last session for post-session diarization and frontmatter finalization
-    private var lastSessionID: Int?
-    private var lastSessionFilePath: URL?
-    private var lastSessionStartTime: Date?
-    private var lastSpeakersDetected: Set<String> = []
-    private var lastSessionContext: String = ""
+    /// What post-session work needs from a session that has ended: where its
+    /// transcript lives, the header inputs, and its utterances — so the file can
+    /// also be rebuilt if it disappears during diarization, which runs for
+    /// minutes on a long meeting.
+    private struct EndedSession {
+        var filePath: URL
+        let startTime: Date
+        let endTime: Date
+        var speakersDetected: Set<String>
+        let context: String
+        let utterances: [(speaker: String, text: String, timestamp: Date)]
+        let sourceApp: String
+        let sessionType: SessionType
+    }
+
+    /// Ended sessions still awaiting post-session work, keyed by session ID.
+    /// Back-to-back meetings — or a Teams mic flicker starting and stopping a
+    /// false session — can end another session while this one is still being
+    /// diarized. A single "last session" slot let that one overwrite this one's
+    /// state and the diarization result was thrown away as stale.
+    private var endedSessions: [Int: EndedSession] = [:]
 
     func startSession(sourceApp: String, vaultPath: String, sessionType: SessionType = .callCapture) throws {
         if fileHandle != nil {
@@ -208,19 +212,18 @@ tags:
     /// sitting unattended in the vault. Returns false only if it is gone and
     /// cannot be rebuilt.
     @discardableResult
-    private func restoreEndedTranscriptIfDeleted() -> Bool {
-        guard let path = lastSessionFilePath else { return false }
+    private func restoreEndedTranscriptIfDeleted(_ session: EndedSession) -> Bool {
+        let path = session.filePath
         guard !FileManager.default.fileExists(atPath: path.path) else { return true }
-        guard let startTime = lastSessionStartTime else { return false }
 
-        diagLog("[LOGGER] ended transcript vanished — rebuilding \(path.lastPathComponent) with \(lastSessionUtterances.count) utterances")
+        diagLog("[LOGGER] ended transcript vanished — rebuilding \(path.lastPathComponent) with \(session.utterances.count) utterances")
 
         let content = Self.transcriptContent(
             filename: path.lastPathComponent,
-            sourceApp: lastSourceApp,
-            sessionType: lastSessionType,
-            startTime: startTime,
-            utterances: lastSessionUtterances
+            sourceApp: session.sourceApp,
+            sessionType: session.sessionType,
+            startTime: session.startTime,
+            utterances: session.utterances
         )
         guard FileManager.default.createFile(atPath: path.path, contents: content.data(using: .utf8)) else {
             diagLog("[LOGGER] rebuild failed — cannot recreate \(path.path)")
@@ -353,15 +356,18 @@ tags:
         fileHandle = nil
 
         // Retain for post-session diarization and frontmatter finalization
-        lastSessionID = sessionID
-        lastSessionFilePath = currentFilePath
-        lastSessionStartTime = sessionStartTime
-        lastSpeakersDetected = speakersDetected
-        lastSessionContext = sessionContext
-        lastUtteranceCount = sessionUtterances.count
-        lastSessionUtterances = sessionUtterances
-        lastSourceApp = sourceApp
-        lastSessionType = sessionType
+        if let filePath = currentFilePath, let startTime = sessionStartTime {
+            endedSessions[sessionID] = EndedSession(
+                filePath: filePath,
+                startTime: startTime,
+                endTime: Date(),
+                speakersDetected: speakersDetected,
+                context: sessionContext,
+                utterances: sessionUtterances,
+                sourceApp: sourceApp,
+                sessionType: sessionType
+            )
+        }
 
         // Reset state immediately so next session can start
         currentSessionID = nil
@@ -385,23 +391,15 @@ tags:
     /// Returns true when the session was discarded, meaning the caller should
     /// skip the rest of the post-session work.
     func discardIfEmpty(sessionID: Int, shorterThan minimumDuration: TimeInterval) -> Bool {
-        guard sessionID == lastSessionID else { return false }
-        guard lastUtteranceCount == 0 else { return false }
-        guard let startTime = lastSessionStartTime,
-              Date().timeIntervalSince(startTime) < minimumDuration else { return false }
+        guard let session = endedSessions[sessionID],
+              session.utterances.isEmpty else { return false }
+        let duration = session.endTime.timeIntervalSince(session.startTime)
+        guard duration < minimumDuration else { return false }
 
-        if let path = lastSessionFilePath {
-            try? FileManager.default.removeItem(at: path)
-            diagLog("[LOGGER] discarded empty \(Int(Date().timeIntervalSince(startTime)))s session — \(path.lastPathComponent)")
-        }
+        try? FileManager.default.removeItem(at: session.filePath)
+        diagLog("[LOGGER] discarded empty \(Int(duration))s session — \(session.filePath.lastPathComponent)")
 
-        lastSessionID = nil
-        lastSessionFilePath = nil
-        lastSessionStartTime = nil
-        lastSpeakersDetected = []
-        lastSessionContext = ""
-        lastUtteranceCount = 0
-        lastSessionUtterances = []
+        endedSessions[sessionID] = nil
         return true
     }
 
@@ -409,27 +407,27 @@ tags:
     /// duration, speaker count, attendees, and optionally renames the file.
     @discardableResult
     func finalizeFrontmatter(sessionID: Int) async -> URL? {
-        guard sessionID == lastSessionID else {
-            diagLog("[LOGGER] finalizeFrontmatter for stale session \(sessionID) — ignoring")
+        // Remove before the first await so a duplicate call can't finalize twice.
+        guard let session = endedSessions.removeValue(forKey: sessionID) else {
+            diagLog("[LOGGER] finalizeFrontmatter for unknown session \(sessionID) — ignoring")
             return nil
         }
-        guard let filePath = lastSessionFilePath,
-              let startTime = lastSessionStartTime else {
-            diagLog("[LOGGER] finalizeFrontmatter for session \(sessionID) — no retained path/start time, skipping")
-            return nil
-        }
-        restoreEndedTranscriptIfDeleted()
+        let filePath = session.filePath
+        let startTime = session.startTime
+        restoreEndedTranscriptIfDeleted(session)
 
         await Self.rewriteFrontmatter(
             filePath: filePath,
             startTime: startTime,
-            speakers: lastSpeakersDetected,
-            context: lastSessionContext
+            endTime: session.endTime,
+            speakers: session.speakersDetected,
+            context: session.context
         )
 
-        // Update lastSessionFilePath if the file was renamed
-        if !lastSessionContext.isEmpty {
-            let truncated = String(lastSessionContext.prefix(50))
+        // Report the new path if the file was renamed
+        var savedPath = filePath
+        if !session.context.isEmpty {
+            let truncated = String(session.context.prefix(50))
                 .replacingOccurrences(of: "/", with: "-")
                 .replacingOccurrences(of: ":", with: "-")
                 .trimmingCharacters(in: .whitespaces)
@@ -437,23 +435,16 @@ tags:
             dateFmt.dateFormat = "yyyy-MM-dd HH-mm-ss"
             let datePrefix = dateFmt.string(from: startTime)
             let newFilename = "\(datePrefix) \(truncated).md"
-            let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
-            lastSessionFilePath = newPath
+            savedPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
         }
 
-        let savedPath = lastSessionFilePath
-        lastSessionID = nil
-        lastSessionStartTime = nil
-        lastSpeakersDetected = []
-        lastSessionContext = ""
-        lastUtteranceCount = 0
-        lastSessionUtterances = []
         return savedPath
     }
 
     private static func rewriteFrontmatter(
         filePath: URL,
         startTime: Date,
+        endTime: Date,
         speakers: Set<String>,
         context: String
     ) async {
@@ -462,8 +453,9 @@ tags:
             return
         }
 
-        // Calculate duration
-        let elapsed = Date().timeIntervalSince(startTime)
+        // Calculate duration up to the stop, not up to now — finalizing waits
+        // for diarization, which can take a minute or more.
+        let elapsed = endTime.timeIntervalSince(startTime)
         let minutes = Int(elapsed) / 60
         let seconds = Int(elapsed) % 60
         let durationStr = String(format: "%02d:%02d", minutes, seconds)
@@ -507,8 +499,9 @@ tags:
             finalPath = newPath
         }
 
-        // Atomic write
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_tmp.md")
+        // Atomic write. Runs off the actor, so it may overlap the live session's
+        // updateContext() or another session's finalize in the same folder.
+        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_tmp_\(UUID().uuidString).md")
         try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
 
         if finalPath != filePath {
@@ -526,20 +519,17 @@ tags:
     /// the transcript shows its real coverage instead of hiding gaps behind a
     /// plausible-looking speaker number.
     func rewriteWithDiarization(_ diarization: PostSessionDiarization, sessionID: Int) {
-        guard sessionID == lastSessionID else {
-            diagLog("[DIARIZE] rewrite for stale session \(sessionID) — ignoring")
+        guard let session = endedSessions[sessionID] else {
+            diagLog("[DIARIZE] no retained state for session \(sessionID) — cannot rewrite")
             return
         }
-        guard let filePath = lastSessionFilePath else {
-            diagLog("[DIARIZE] no transcript path retained for session \(sessionID) — cannot rewrite")
-            return
-        }
+        let filePath = session.filePath
         let segments = diarization.segments
         guard !segments.isEmpty else {
             diagLog("[DIARIZE] no segments for session \(sessionID) — nothing to rewrite")
             return
         }
-        restoreEndedTranscriptIfDeleted()
+        restoreEndedTranscriptIfDeleted(session)
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else {
             diagLog("[DIARIZE] cannot read \(filePath.path) — transcript deleted or unreadable, rewrite skipped")
             return
@@ -618,7 +608,7 @@ tags:
         var speakers = appliedLabels
         if content.contains("**You** (") { speakers.insert("You") }
         if unattributed > 0 { speakers.insert("Them") }
-        lastSpeakersDetected = speakers
+        endedSessions[sessionID]?.speakersDetected = speakers
 
         Self.writeAtomically(content, to: filePath, tmpName: ".tome_diar_tmp.md")
     }
@@ -627,14 +617,13 @@ tags:
     /// diarization produced nothing: collapse the live "Them" labels to
     /// "Speaker 2" so the transcript still reads as a two-party conversation.
     func collapseUnattributedSpeakers(sessionID: Int) {
-        guard sessionID == lastSessionID else { return }
-        guard let filePath = lastSessionFilePath,
+        guard let filePath = endedSessions[sessionID]?.filePath,
               let content = try? String(contentsOf: filePath, encoding: .utf8),
               content.contains("**Them** (") else { return }
 
         let collapsed = content.replacingOccurrences(of: "**Them** (", with: "**Speaker 2** (")
-        lastSpeakersDetected.remove("Them")
-        lastSpeakersDetected.insert("Speaker 2")
+        endedSessions[sessionID]?.speakersDetected.remove("Them")
+        endedSessions[sessionID]?.speakersDetected.insert("Speaker 2")
         Self.writeAtomically(collapsed, to: filePath, tmpName: ".tome_diar_tmp.md")
     }
 

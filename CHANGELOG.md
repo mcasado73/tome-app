@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Diarization
+- Diarization is no longer discarded when another session ends while it runs. Only one ended session was retained, so a Teams mic flicker — a false session starting and stopping within seconds — or a short back-to-back call overwrote the meeting still being diarized, and its result was dropped as stale along with the speaker fallback and frontmatter finalization. Ended sessions are now retained per session ID until their post-session work completes
+- Transcript duration is measured up to the stop instead of up to finalization, which waits for diarization and added a minute or more on long meetings
+- Frontmatter finalization writes through its own temp file instead of the one shared with the live session's context updates
+
 ## [1.3.0] — 2026-09-17
 
 ### Auto-start on meeting detection
