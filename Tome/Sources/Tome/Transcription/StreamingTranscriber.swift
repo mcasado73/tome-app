@@ -4,7 +4,15 @@ import os
 
 // VAD + ASR pipeline
 final class StreamingTranscriber: @unchecked Sendable {
-    private let asrManager: AsrManager
+    private let asrProvider: ASRProvider
+    private var asrManager: AsrManager?
+    private var asrGeneration = 0
+    /// Consecutive failed `transcribe` calls. Kept apart from VAD errors: VAD
+    /// keeps succeeding while ASR is broken, and sharing one counter meant every
+    /// good VAD chunk reset it, so a dead ASR never surfaced and the session
+    /// just recorded nothing.
+    private var asrFailures = 0
+    private var asrReloads = 0
     private let vadManager: VadManager
     private let speaker: Speaker
     private let audioSource: AudioSource
@@ -22,14 +30,14 @@ final class StreamingTranscriber: @unchecked Sendable {
     )!
 
     init(
-        asrManager: AsrManager,
+        asrProvider: ASRProvider,
         vadManager: VadManager,
         speaker: Speaker,
         audioSource: AudioSource = .microphone,
         onPartial: @escaping @Sendable (String) -> Void,
         onFinal: @escaping @Sendable (String) -> Void
     ) {
-        self.asrManager = asrManager
+        self.asrProvider = asrProvider
         self.vadManager = vadManager
         self.speaker = speaker
         self.audioSource = audioSource
@@ -42,11 +50,18 @@ final class StreamingTranscriber: @unchecked Sendable {
     /// Flush speech for transcription every ~30 seconds (480,000 samples at 16kHz).
     /// Longer chunks give Parakeet-TDT more context for better accuracy.
     private static let flushInterval = 480_000
+    /// Consecutive errors after which the loop gives up.
+    private static let maxConsecutiveErrors = 10
+    /// ASR failures in a row before the models are reloaded off the ANE.
+    private static let asrFailuresBeforeReload = 3
+    /// Reloads attempted per transcriber before letting the loop fail.
+    private static let maxAsrReloads = 2
 
     /// Main loop: reads audio buffers, runs VAD, transcribes speech segments.
     /// Returns `true` if the loop exited due to fatal (repeated) errors.
     @discardableResult
     func run(stream: AsyncStream<AVAudioPCMBuffer>) async -> Bool {
+        (asrManager, asrGeneration) = await asrProvider.current()
         var vadState = await vadManager.makeStreamState()
         var speechSamples: [Float] = []
         var vadBuffer: [Float] = []
@@ -98,12 +113,8 @@ final class StreamingTranscriber: @unchecked Sendable {
                             if speechSamples.count > 8000 {
                                 let segment = speechSamples
                                 speechSamples.removeAll(keepingCapacity: true)
-                                if await !transcribeSegment(segment) {
-                                    consecutiveErrors += 1
-                                    if consecutiveErrors > 10 { break outerLoop }
-                                } else {
-                                    consecutiveErrors = 0
-                                }
+                                await transcribeSegment(segment)
+                                if asrFailures > Self.maxConsecutiveErrors { break outerLoop }
                             } else {
                                 speechSamples.removeAll(keepingCapacity: true)
                             }
@@ -117,41 +128,61 @@ final class StreamingTranscriber: @unchecked Sendable {
                         if speechSamples.count >= Self.flushInterval {
                             let segment = speechSamples
                             speechSamples.removeAll(keepingCapacity: true)
-                            if await !transcribeSegment(segment) {
-                                consecutiveErrors += 1
-                                if consecutiveErrors > 10 { break outerLoop }
-                            } else {
-                                consecutiveErrors = 0
-                            }
+                            await transcribeSegment(segment)
+                            if asrFailures > Self.maxConsecutiveErrors { break outerLoop }
                         }
                     }
                 } catch {
                     log.error("VAD error: \(error.localizedDescription)")
                     consecutiveErrors += 1
-                    if consecutiveErrors > 10 { break outerLoop }
+                    if consecutiveErrors > Self.maxConsecutiveErrors { break outerLoop }
                 }
             }
         }
 
         if speechSamples.count > 8000 {
-            _ = await transcribeSegment(speechSamples)
+            await transcribeSegment(speechSamples)
         }
 
-        return consecutiveErrors > 10
+        if asrFailures > Self.maxConsecutiveErrors {
+            diagLog("[\(speaker.rawValue)] giving up after \(asrFailures) consecutive ASR errors")
+        }
+        return consecutiveErrors > Self.maxConsecutiveErrors || asrFailures > Self.maxConsecutiveErrors
     }
 
-    /// Returns `true` on success, `false` on ASR error.
-    private func transcribeSegment(_ samples: [Float]) async -> Bool {
+    /// Transcribes one speech segment, updating `asrFailures`. After a few
+    /// failures in a row the models are reloaded off the ANE and the segment is
+    /// retried once, so the speech that exposed the failure isn't lost.
+    private func transcribeSegment(_ samples: [Float], isRetry: Bool = false) async {
+        guard let asrManager else { return }
         do {
             let result = try await asrManager.transcribe(samples, source: audioSource)
+            asrFailures = 0
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return true }
+            guard !text.isEmpty else { return }
             log.info("[\(self.speaker.rawValue)] transcribed: \(text.prefix(80))")
             onFinal(text)
-            return true
         } catch {
+            asrFailures += 1
             log.error("ASR error: \(error.localizedDescription)")
-            return false
+            diagLog("[\(speaker.rawValue)] ASR error #\(asrFailures): \(error)")
+
+            guard !isRetry else { return }
+            // The other stream may already have reloaded the models; switch
+            // to them right away instead of failing our way up to a reload.
+            let latest = await asrProvider.current()
+            if latest.generation > asrGeneration {
+                (self.asrManager, asrGeneration) = latest
+                await transcribeSegment(samples, isRetry: true)
+                return
+            }
+            guard asrFailures >= Self.asrFailuresBeforeReload,
+                  asrReloads < Self.maxAsrReloads
+            else { return }
+            asrReloads += 1
+            guard let fresh = await asrProvider.recover(after: asrGeneration) else { return }
+            (self.asrManager, asrGeneration) = fresh
+            await transcribeSegment(samples, isRetry: true)
         }
     }
 

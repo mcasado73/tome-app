@@ -87,7 +87,7 @@ final class TranscriptionEngine {
     private static let micSwapDebounce = Duration.seconds(1)
 
     /// Shared FluidAudio instances
-    private var asrManager: AsrManager?
+    private var asrProvider: ASRProvider?
     private var micVadManager: VadManager?
     private var sysVadManager: VadManager?
 
@@ -131,11 +131,7 @@ final class TranscriptionEngine {
         assetStatus = "Downloading multilingual model (first run)..."
         diagLog("[ENGINE-1] loading FluidAudio ASR models...")
         do {
-            let models = try await AsrModels.downloadAndLoad(version: .v3)
-            assetStatus = "Initializing ASR..."
-            let asr = AsrManager(config: .default)
-            try await asr.loadModels(models)
-            self.asrManager = asr
+            self.asrProvider = try await ASRProvider.load()
 
             assetStatus = "Loading VAD model..."
             diagLog("[ENGINE-1b] loading VAD model...")
@@ -155,7 +151,7 @@ final class TranscriptionEngine {
             return
         }
 
-        guard let asrManager, let micVadManager, let sysVadManager else { return }
+        guard let asrProvider, let micVadManager, let sysVadManager else { return }
 
         // 2. Start mic capture
         userSelectedDeviceID = inputDeviceID
@@ -180,12 +176,12 @@ final class TranscriptionEngine {
         // 4. Start mic transcription
         let store = transcriptStore
         let corrector = vocabularyCorrector
-        micTask = makeMicTask(stream: micStream, asrManager: asrManager, vadManager: micVadManager)
+        micTask = makeMicTask(stream: micStream, asrProvider: asrProvider, vadManager: micVadManager)
 
         // 5. Start system audio transcription
         if let sysStream = sysStreams?.systemAudio {
             let sysTranscriber = StreamingTranscriber(
-                asrManager: asrManager,
+                asrProvider: asrProvider,
                 vadManager: sysVadManager,
                 speaker: .them,
                 audioSource: .system,
@@ -225,13 +221,13 @@ final class TranscriptionEngine {
     /// Builds the mic `StreamingTranscriber` and the task that drives it.
     private func makeMicTask(
         stream: sending AsyncStream<AVAudioPCMBuffer>,
-        asrManager: AsrManager,
+        asrProvider: ASRProvider,
         vadManager: VadManager
     ) -> Task<Void, Never> {
         let store = transcriptStore
         let corrector = vocabularyCorrector
         let micTranscriber = StreamingTranscriber(
-            asrManager: asrManager,
+            asrProvider: asrProvider,
             vadManager: vadManager,
             speaker: .you,
             audioSource: .microphone,
@@ -260,7 +256,7 @@ final class TranscriptionEngine {
     /// Tears down the current mic pipeline and rebuilds it on `deviceID`,
     /// leaving system audio and the loaded models untouched.
     private func rebindMic(to deviceID: AudioDeviceID) {
-        guard let asrManager, let micVadManager else { return }
+        guard let asrProvider, let micVadManager else { return }
 
         micTask?.cancel()
         micTask = nil
@@ -270,13 +266,13 @@ final class TranscriptionEngine {
         // 0 means "no explicit device": let MicCapture fall back to the system
         // default rather than asking CoreAudio to bind to device ID 0.
         let micStream = micCapture.bufferStream(deviceID: deviceID > 0 ? deviceID : nil)
-        micTask = makeMicTask(stream: micStream, asrManager: asrManager, vadManager: micVadManager)
+        micTask = makeMicTask(stream: micStream, asrProvider: asrProvider, vadManager: micVadManager)
     }
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
     /// Pass the raw setting value (0 = system default, or a specific AudioDeviceID).
     func restartMic(inputDeviceID: AudioDeviceID) {
-        guard isRunning, asrManager != nil, micVadManager != nil else { return }
+        guard isRunning, asrProvider != nil, micVadManager != nil else { return }
 
         // Only update user selection when explicitly changed (not from OS listener)
         if inputDeviceID != 0 || userSelectedDeviceID != 0 {
