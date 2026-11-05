@@ -29,6 +29,7 @@ struct ContentView: View {
     @State private var activeSessionType: SessionType?
     @State private var detectedAppName: String?
     @State private var silenceSeconds: Int = 0
+    @State private var meetingEndCountdown: Int?
     @State private var savedFileURL: URL?
     @State private var bannerDismissTask: Task<Void, Never>?
     @State private var sessionElapsed: Int = 0
@@ -68,6 +69,7 @@ struct ContentView: View {
                 audioLevel: audioLevel,
                 detectedApp: detectedAppName,
                 silenceSeconds: silenceSeconds,
+                meetingEndCountdown: meetingEndCountdown,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError,
                 // F8: dispatch via main runloop to avoid the SwiftUI 26.4
@@ -125,8 +127,12 @@ struct ContentView: View {
                 try? await Task.sleep(for: .seconds(1))
                 guard isRunning else {
                     silenceSeconds = 0
+                    meetingEndCountdown = nil
                     continue
                 }
+                meetingEndCountdown = activeSessionType == .callCapture
+                    ? meetingDetector.pendingStopDeadline.map { max(0, Int($0.timeIntervalSinceNow.rounded(.up))) }
+                    : nil
                 sessionElapsed += 1
                 if audioLevel < 0.01 {
                     silenceSeconds += 1

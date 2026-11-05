@@ -19,6 +19,9 @@ struct ControlBar: View {
     let audioLevel: Float
     let detectedApp: String?
     let silenceSeconds: Int
+    /// Seconds until auto-stop after the meeting app released the mic; nil when
+    /// no stop is pending.
+    let meetingEndCountdown: Int?
     let statusMessage: String?
     let errorMessage: String?
     let onStartCallCapture: () -> Void
@@ -78,7 +81,14 @@ struct ControlBar: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
 
-                if silenceSeconds >= 90 {
+                if let remaining = meetingEndCountdown {
+                    Text("Meeting ended — auto-stop in \(remaining)s")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 4)
+                } else if silenceSeconds >= 90 {
                     Text("Silence — auto-stop in \(120 - silenceSeconds)s")
                         .font(.system(size: 10))
                         .foregroundStyle(.orange)

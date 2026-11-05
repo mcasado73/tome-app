@@ -159,7 +159,12 @@ final class StreamingTranscriber: @unchecked Sendable {
             let result = try await asrManager.transcribe(samples, source: audioSource)
             asrFailures = 0
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return }
+            guard !text.isEmpty else {
+                // Persist these: a whole session of empty results (27-oct 14:05)
+                // left no trace, since `log.info` isn't kept by the unified log.
+                diagLog("[\(speaker.rawValue)] ASR empty result, samples=\(samples.count)")
+                return
+            }
             log.info("[\(self.speaker.rawValue)] transcribed: \(text.prefix(80))")
             onFinal(text)
         } catch {

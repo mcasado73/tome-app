@@ -17,6 +17,9 @@ import Darwin  // proc_pidpath
 @MainActor
 final class MeetingDetector {
     private(set) var detectedApp: (bundleID: String, name: String)?
+    /// When the pending auto-stop will fire, while the conferencing app has
+    /// released the mic and we're waiting out `stopDelay`. Drives the UI countdown.
+    private(set) var pendingStopDeadline: Date?
 
     private var processListListener: AudioObjectPropertyListenerBlock?
     private var perProcessListeners: [AudioObjectID: AudioObjectPropertyListenerBlock] = [:]
@@ -127,6 +130,7 @@ final class MeetingDetector {
         isInstalled = false
         stopDebounceTask?.cancel()
         stopDebounceTask = nil
+        pendingStopDeadline = nil
         pollTask?.cancel()
         pollTask = nil
 
@@ -239,6 +243,7 @@ final class MeetingDetector {
             // A conferencing app is using the mic — cancel any pending stop.
             stopDebounceTask?.cancel()
             stopDebounceTask = nil
+            pendingStopDeadline = nil
 
             if detectedApp == nil {
                 diagLog("[MEETING-DETECT] \(current.name) (\(current.bundleID)) opened mic — starting")
@@ -250,6 +255,7 @@ final class MeetingDetector {
             guard let tracking = detectedApp, stopDebounceTask == nil else { return }
             diagLog("[MEETING-DETECT] \(tracking.name) released mic — debouncing \(stopDelay)s")
             let delay = stopDelay
+            pendingStopDeadline = Date().addingTimeInterval(TimeInterval(delay))
             stopDebounceTask = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(delay))
                 guard !Task.isCancelled, let self else { return }
@@ -257,6 +263,7 @@ final class MeetingDetector {
                     diagLog("[MEETING-DETECT] still released after \(delay)s — signaling stop")
                     self.detectedApp = nil
                     self.stopDebounceTask = nil
+                    self.pendingStopDeadline = nil
                     self.onMeetingStopped?()
                 }
             }

@@ -10,7 +10,10 @@ struct TomeApp: App {
     private let updaterController = AppUpdaterController()
 
     var body: some Scene {
-        WindowGroup {
+        // A single-instance Window rather than a WindowGroup: ContentView owns the
+        // transcription engine and wires up the meeting detector, so a second copy
+        // (Cmd+N) would mean two engines racing for the same meeting.
+        Window("Tome", id: MainWindow.id) {
             ContentView(settings: settings, meetingDetector: meetingDetector)
                 .onAppear {
                     settings.applyScreenShareVisibility()
@@ -30,13 +33,50 @@ struct TomeApp: App {
             Text("Tome")
                 .font(.headline)
             Divider()
+            ShowTomeButton()
             Button("Quit Tome") {
                 NSApplication.shared.terminate(nil)
             }
             .keyboardShortcut("q")
         } label: {
-            Image(systemName: "book.closed")
-                .symbolRenderingMode(.monochrome)
+            MenuBarLabel()
+        }
+    }
+}
+
+enum MainWindow {
+    static let id = "main"
+}
+
+/// The menu bar label is the one view SwiftUI renders on every launch, even when
+/// the main window isn't restored (e.g. Tome launched as a login item after the
+/// window was closed). Auto-start only arms once ContentView appears, so open the
+/// main window from here — otherwise meetings go unrecorded until the user
+/// happens to open Tome by hand.
+private struct MenuBarLabel: View {
+    @Environment(\.openWindow) private var openWindow
+    @MainActor private static var didEnsureMainWindow = false
+
+    var body: some View {
+        Image(systemName: "book.closed")
+            .symbolRenderingMode(.monochrome)
+            .task {
+                // The status item can be rebuilt later (display changes), so only
+                // force the window open once per launch.
+                guard !Self.didEnsureMainWindow else { return }
+                Self.didEnsureMainWindow = true
+                openWindow(id: MainWindow.id)
+            }
+    }
+}
+
+private struct ShowTomeButton: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Show Tome") {
+            openWindow(id: MainWindow.id)
+            NSApp.activate()
         }
     }
 }
